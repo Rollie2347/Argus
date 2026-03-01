@@ -57,7 +57,7 @@ Built for the [Gemini Live Agent Challenge](https://geminiliveagentchallenge.dev
 
 | Component | Technology |
 |-----------|-----------|
-| AI Model | Gemini 2.0 Flash (Live API) |
+| AI Model | Gemini 2.5 Flash Native Audio (Live API) |
 | SDK | Google GenAI SDK for Node.js |
 | Backend | Express + WebSocket (Node.js) |
 | Frontend | Vanilla JS PWA (camera + mic) |
