@@ -24,7 +24,7 @@ Your role: You see the user's world through their camera and help with whatever 
 
 Your personality:
 - Warm, friendly, and efficient — like a knowledgeable friend, not a corporate assistant
-- Proactive — point out things you notice before being asked ("your oil is starting to smoke")
+- Proactive — point out things you notice before being asked
 - Contextually appropriate — match the energy of the situation
 - Slightly witty but never annoying
 - Concise by default — short helpful responses, elaborate only when needed
@@ -42,11 +42,9 @@ Guidelines:
 - If you see something broken/a tool, offer fix-it guidance
 - For anything else, be a helpful visual assistant
 - Always be grounded — if you're not sure what you see, say so
-- Handle interruptions gracefully — if the user changes topic mid-sentence, roll with it
+- Handle interruptions gracefully
 - Keep responses SHORT for voice — 1-3 sentences unless they ask for detail
 - Be proactive about what you see — don't just wait for questions`;
-
-const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 
 // Express app for serving frontend
 const app = express();
@@ -70,10 +68,10 @@ const wss = new WebSocketServer({ server, path: "/ws" });
 wss.on("connection", async (clientWs) => {
   console.log("👁️ Client connected");
 
+  const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
   let session = null;
 
   try {
-    // Connect to Gemini Live API
     session = await ai.live.connect({
       model: MODEL,
       config: {
@@ -87,70 +85,78 @@ wss.on("connection", async (clientWs) => {
           parts: [{ text: SYSTEM_INSTRUCTION }],
         },
       },
+      callbacks: {
+        onopen: () => {
+          console.log("🔗 Connected to Gemini Live API");
+          if (clientWs.readyState === WebSocket.OPEN) {
+            clientWs.send(JSON.stringify({ type: "connected" }));
+          }
+        },
+
+        onmessage: (msg) => {
+          if (clientWs.readyState !== WebSocket.OPEN) return;
+
+          try {
+            // Audio response from Gemini
+            if (msg.data) {
+              const audioB64 =
+                typeof msg.data === "string"
+                  ? msg.data
+                  : Buffer.from(msg.data).toString("base64");
+              clientWs.send(JSON.stringify({ type: "audio", data: audioB64 }));
+            }
+
+            // Text response
+            if (msg.text) {
+              clientWs.send(JSON.stringify({ type: "text", data: msg.text }));
+            }
+
+            // Turn complete
+            if (
+              msg.serverContent &&
+              msg.serverContent.turnComplete
+            ) {
+              clientWs.send(JSON.stringify({ type: "turn_complete" }));
+            }
+          } catch (err) {
+            console.error("Error forwarding to client:", err.message);
+          }
+        },
+
+        onerror: (err) => {
+          console.error("Gemini session error:", err);
+          if (clientWs.readyState === WebSocket.OPEN) {
+            clientWs.send(
+              JSON.stringify({ type: "error", data: "Gemini connection error" })
+            );
+          }
+        },
+
+        onclose: (ev) => {
+          console.log("Gemini session closed");
+          if (clientWs.readyState === WebSocket.OPEN) {
+            clientWs.close();
+          }
+        },
+      },
     });
 
-    console.log("🔗 Connected to Gemini Live API");
-
-    // Receive from Gemini → send to client
-    session.on("message", (msg) => {
-      if (clientWs.readyState !== WebSocket.OPEN) return;
-
-      try {
-        // Handle audio response
-        if (msg.data) {
-          const audioB64 =
-            typeof msg.data === "string"
-              ? msg.data
-              : Buffer.from(msg.data).toString("base64");
-          clientWs.send(JSON.stringify({ type: "audio", data: audioB64 }));
-        }
-
-        // Handle text response
-        if (msg.text) {
-          clientWs.send(JSON.stringify({ type: "text", data: msg.text }));
-        }
-
-        // Handle turn complete
-        if (msg.serverContent?.turnComplete) {
-          clientWs.send(JSON.stringify({ type: "turn_complete" }));
-        }
-      } catch (err) {
-        console.error("Error forwarding to client:", err.message);
-      }
-    });
-
-    session.on("error", (err) => {
-      console.error("Gemini session error:", err);
-      if (clientWs.readyState === WebSocket.OPEN) {
-        clientWs.send(
-          JSON.stringify({ type: "error", data: "Gemini connection error" })
-        );
-      }
-    });
-
-    session.on("close", () => {
-      console.log("Gemini session closed");
-      if (clientWs.readyState === WebSocket.OPEN) {
-        clientWs.close();
-      }
-    });
+    console.log("✅ Gemini session established");
 
     // Receive from client → send to Gemini
-    clientWs.on("message", async (raw) => {
+    clientWs.on("message", (raw) => {
       try {
         const msg = JSON.parse(raw.toString());
 
-        if (msg.type === "audio") {
-          // Audio from browser (base64 PCM16 16kHz)
-          await session.sendRealtimeInput({
+        if (msg.type === "audio" && session) {
+          session.sendRealtimeInput({
             media: {
               data: msg.data,
               mimeType: "audio/pcm;rate=16000",
             },
           });
-        } else if (msg.type === "image") {
-          // Video frame from browser (base64 JPEG)
-          await session.sendRealtimeInput({
+        } else if (msg.type === "image" && session) {
+          session.sendRealtimeInput({
             media: {
               data: msg.data,
               mimeType: "image/jpeg",
@@ -165,14 +171,16 @@ wss.on("connection", async (clientWs) => {
     clientWs.on("close", () => {
       console.log("👁️ Client disconnected");
       if (session) {
-        session.close();
+        try { session.close(); } catch (_) {}
+        session = null;
       }
     });
 
     clientWs.on("error", (err) => {
       console.error("Client WebSocket error:", err.message);
       if (session) {
-        session.close();
+        try { session.close(); } catch (_) {}
+        session = null;
       }
     });
   } catch (err) {

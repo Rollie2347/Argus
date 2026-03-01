@@ -406,13 +406,19 @@
             ws.onmessage = (event) => {
                 const msg = JSON.parse(event.data);
 
-                if (msg.type === 'audio') {
+                if (msg.type === 'connected') {
+                    setStatus('listening', '● Listening');
+                    addTranscript('Argus is ready. I can see and hear you.', 'argus');
+                } else if (msg.type === 'audio') {
                     setStatus('speaking', '● Speaking');
                     playAudio(msg.data);
                 } else if (msg.type === 'text') {
                     addTranscript(msg.data, 'argus');
                 } else if (msg.type === 'turn_complete') {
                     setStatus('listening', '● Listening');
+                } else if (msg.type === 'error') {
+                    addTranscript('Error: ' + msg.data, 'argus');
+                    setStatus('', 'Error');
                 }
             };
 
