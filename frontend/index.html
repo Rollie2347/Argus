@@ -282,6 +282,9 @@
         let audioContext = null;
         let audioProcessor = null;
         let playbackContext = null;
+        let audioQueue = [];
+        let isPlaying = false;
+        let nextPlayTime = 0;
         let isConnected = false;
         let isMuted = false;
         let facingMode = 'environment'; // back camera by default
@@ -443,6 +446,11 @@
             if (frameInterval) clearInterval(frameInterval);
             if (audioProcessor) audioProcessor.disconnect();
             if (audioContext) audioContext.close();
+            if (playbackContext) {
+                playbackContext.close();
+                playbackContext = null;
+            }
+            nextPlayTime = 0;
             if (ws && ws.readyState === WebSocket.OPEN) ws.close();
             ws = null;
         }
@@ -463,12 +471,19 @@
                 const buffer = playbackContext.createBuffer(1, float32.length, 24000);
                 buffer.getChannelData(0).set(float32);
 
+                // Schedule audio chunks sequentially instead of overlapping
+                const now = playbackContext.currentTime;
+                if (nextPlayTime < now) {
+                    nextPlayTime = now;
+                }
+
                 const source = playbackContext.createBufferSource();
                 source.buffer = buffer;
                 source.connect(playbackContext.destination);
-                source.start();
+                source.start(nextPlayTime);
+                nextPlayTime += buffer.duration;
 
-                // Animate waveform during playback
+                // Animate waveform
                 const rms = Math.sqrt(float32.reduce((sum, v) => sum + v * v, 0) / float32.length);
                 updateWaveform(rms * 3);
             } catch (err) {
