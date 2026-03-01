@@ -16,7 +16,7 @@ dotenv.config();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 8080;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const MODEL = "gemini-2.0-flash-live";
+const MODEL = "gemini-2.5-flash-native-audio-preview-12-2025";
 
 const SYSTEM_INSTRUCTION = `You are Argus, an all-seeing AI life companion named after Argus Panoptes — the hundred-eyed guardian of Greek mythology.
 
@@ -97,6 +97,14 @@ wss.on("connection", async (clientWs) => {
           if (clientWs.readyState !== WebSocket.OPEN) return;
 
           try {
+            // Log what we got
+            const keys = Object.keys(msg || {});
+            console.log(`📨 Gemini msg keys: [${keys.join(", ")}]`, 
+              msg.data ? `data: ${typeof msg.data} (${String(msg.data).length} chars)` : "",
+              msg.text ? `text: "${msg.text.substring(0, 80)}"` : "",
+              msg.serverContent ? `serverContent: ${JSON.stringify(Object.keys(msg.serverContent))}` : ""
+            );
+
             // Audio response from Gemini
             if (msg.data) {
               const audioB64 =
@@ -124,7 +132,7 @@ wss.on("connection", async (clientWs) => {
         },
 
         onerror: (err) => {
-          console.error("Gemini session error:", err);
+          console.error("Gemini session error:", JSON.stringify(err).substring(0, 500));
           if (clientWs.readyState === WebSocket.OPEN) {
             clientWs.send(
               JSON.stringify({ type: "error", data: "Gemini connection error" })
@@ -133,7 +141,7 @@ wss.on("connection", async (clientWs) => {
         },
 
         onclose: (ev) => {
-          console.log("Gemini session closed");
+          console.log("Gemini session closed", ev ? JSON.stringify(ev).substring(0, 200) : "no event");
           if (clientWs.readyState === WebSocket.OPEN) {
             clientWs.close();
           }
@@ -144,11 +152,18 @@ wss.on("connection", async (clientWs) => {
     console.log("✅ Gemini session established");
 
     // Receive from client → send to Gemini
+    let audioChunks = 0;
+    let imageChunks = 0;
+
     clientWs.on("message", (raw) => {
       try {
         const msg = JSON.parse(raw.toString());
 
         if (msg.type === "audio" && session) {
+          audioChunks++;
+          if (audioChunks % 50 === 1) {
+            console.log(`🎤 Audio chunk #${audioChunks} (size: ${msg.data.length} b64 chars)`);
+          }
           session.sendRealtimeInput({
             media: {
               data: msg.data,
@@ -156,6 +171,8 @@ wss.on("connection", async (clientWs) => {
             },
           });
         } else if (msg.type === "image" && session) {
+          imageChunks++;
+          console.log(`📷 Image frame #${imageChunks} (size: ${msg.data.length} b64 chars)`);
           session.sendRealtimeInput({
             media: {
               data: msg.data,
