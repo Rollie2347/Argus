@@ -4,19 +4,176 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
     <title>Argus — The All-Seeing Companion</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@300;400;600;700&family=JetBrains+Mono:wght@300;400;500&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
     <style>
+        :root {
+            --gold: #c9a84c;
+            --gold-bright: #e8c55a;
+            --gold-dim: #8a6f2f;
+            --obsidian: #08080c;
+            --surface: #111118;
+            --surface-raised: #1a1a24;
+            --bone: #e8e0d0;
+            --bone-dim: #9e978a;
+            --danger: #c44a3f;
+            --oracle-blue: #4a6fa5;
+            --font-display: 'Cormorant Garamond', Georgia, serif;
+            --font-mono: 'JetBrains Mono', monospace;
+            --font-body: 'DM Sans', sans-serif;
+        }
+
         * { margin: 0; padding: 0; box-sizing: border-box; }
 
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-            background: #0a0a0f;
-            color: #e0e0e0;
+            font-family: var(--font-body);
+            background: var(--obsidian);
+            color: var(--bone);
             height: 100dvh;
             overflow: hidden;
             display: flex;
             flex-direction: column;
         }
 
+        /* ---- NOISE TEXTURE OVERLAY ---- */
+        body::before {
+            content: '';
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.04'/%3E%3C/svg%3E");
+            pointer-events: none;
+            z-index: 9999;
+            opacity: 0.5;
+        }
+
+        /* ---- START SCREEN ---- */
+        #start-screen {
+            position: absolute;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: var(--obsidian);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            z-index: 100;
+            overflow: hidden;
+        }
+
+        #start-screen::before {
+            content: '';
+            position: absolute;
+            top: 50%; left: 50%;
+            width: 600px; height: 600px;
+            transform: translate(-50%, -50%);
+            background: radial-gradient(circle, rgba(201,168,76,0.08) 0%, transparent 70%);
+            border-radius: 50%;
+            animation: breathe 4s ease-in-out infinite;
+        }
+
+        @keyframes breathe {
+            0%, 100% { transform: translate(-50%, -50%) scale(1); opacity: 0.6; }
+            50% { transform: translate(-50%, -50%) scale(1.15); opacity: 1; }
+        }
+
+        /* Eye symbol */
+        .eye-symbol {
+            position: relative;
+            width: 120px;
+            height: 60px;
+            margin-bottom: 32px;
+            animation: fadeSlideIn 1s ease-out;
+        }
+
+        .eye-symbol::before {
+            content: '';
+            position: absolute;
+            top: 0; left: 0;
+            width: 120px; height: 60px;
+            border: 2px solid var(--gold);
+            border-radius: 50% / 100%;
+            transform: rotate(0deg);
+        }
+
+        .eye-symbol::after {
+            content: '';
+            position: absolute;
+            top: 50%; left: 50%;
+            width: 20px; height: 20px;
+            background: var(--gold);
+            border-radius: 50%;
+            transform: translate(-50%, -50%);
+            box-shadow: 0 0 20px rgba(201,168,76,0.6), 0 0 40px rgba(201,168,76,0.2);
+        }
+
+        .eye-iris {
+            position: absolute;
+            top: 50%; left: 50%;
+            width: 44px; height: 44px;
+            border: 1.5px solid var(--gold-dim);
+            border-radius: 50%;
+            transform: translate(-50%, -50%);
+        }
+
+        #start-screen h1 {
+            font-family: var(--font-display);
+            font-size: 52px;
+            font-weight: 300;
+            letter-spacing: 16px;
+            text-transform: uppercase;
+            color: var(--gold);
+            margin-bottom: 8px;
+            animation: fadeSlideIn 1s ease-out 0.2s both;
+        }
+
+        #start-screen .subtitle {
+            font-family: var(--font-mono);
+            font-size: 11px;
+            font-weight: 300;
+            letter-spacing: 4px;
+            text-transform: uppercase;
+            color: var(--bone-dim);
+            margin-bottom: 56px;
+            animation: fadeSlideIn 1s ease-out 0.4s both;
+        }
+
+        @keyframes fadeSlideIn {
+            from { opacity: 0; transform: translateY(12px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        #btn-start {
+            position: relative;
+            padding: 16px 56px;
+            border: 1px solid var(--gold);
+            background: transparent;
+            color: var(--gold);
+            font-family: var(--font-display);
+            font-size: 18px;
+            font-weight: 600;
+            letter-spacing: 6px;
+            text-transform: uppercase;
+            cursor: pointer;
+            transition: all 0.4s ease;
+            animation: fadeSlideIn 1s ease-out 0.6s both;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        #btn-start::before {
+            content: '';
+            position: absolute;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: var(--gold);
+            opacity: 0;
+            transition: opacity 0.4s ease;
+        }
+
+        #btn-start:hover, #btn-start:active {
+            color: var(--obsidian);
+            background: var(--gold);
+        }
+
+        /* ---- MAIN VIEW ---- */
         #video-container {
             position: relative;
             flex: 1;
@@ -28,8 +185,12 @@
             width: 100%;
             height: 100%;
             object-fit: cover;
+            opacity: 0.85;
         }
 
+        canvas#frame-canvas { display: none; }
+
+        /* ---- HUD OVERLAY ---- */
         #overlay {
             position: absolute;
             top: 0; left: 0; right: 0; bottom: 0;
@@ -39,234 +200,327 @@
             pointer-events: none;
         }
 
+        /* Top bar */
         #header {
-            padding: 16px 20px;
-            background: linear-gradient(to bottom, rgba(0,0,0,0.7), transparent);
+            padding: 20px 24px 40px;
+            background: linear-gradient(to bottom, rgba(8,8,12,0.9) 0%, rgba(8,8,12,0.4) 60%, transparent 100%);
             display: flex;
-            align-items: center;
-            gap: 12px;
+            align-items: flex-start;
+            justify-content: space-between;
         }
 
-        #header h1 {
-            font-size: 20px;
-            font-weight: 700;
-            color: #fff;
+        .header-left {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
         }
 
-        #header .eye {
-            font-size: 24px;
+        .header-left h1 {
+            font-family: var(--font-display);
+            font-size: 22px;
+            font-weight: 300;
+            letter-spacing: 8px;
+            text-transform: uppercase;
+            color: var(--gold);
+        }
+
+        .header-left .tagline {
+            font-family: var(--font-mono);
+            font-size: 9px;
+            font-weight: 300;
+            letter-spacing: 2px;
+            text-transform: uppercase;
+            color: var(--bone-dim);
         }
 
         #status-badge {
-            margin-left: auto;
-            padding: 4px 12px;
-            border-radius: 20px;
-            font-size: 12px;
-            font-weight: 600;
-            background: rgba(255,255,255,0.15);
-            color: #888;
+            padding: 6px 14px;
+            font-family: var(--font-mono);
+            font-size: 10px;
+            font-weight: 500;
+            letter-spacing: 1.5px;
+            text-transform: uppercase;
+            border: 1px solid rgba(255,255,255,0.1);
+            color: var(--bone-dim);
+            background: rgba(8,8,12,0.6);
+            backdrop-filter: blur(8px);
         }
 
         #status-badge.connected {
-            background: rgba(34, 197, 94, 0.2);
-            color: #22c55e;
+            border-color: var(--gold-dim);
+            color: var(--gold);
         }
 
         #status-badge.listening {
-            background: rgba(59, 130, 246, 0.2);
-            color: #3b82f6;
-            animation: pulse 2s infinite;
+            border-color: var(--gold-dim);
+            color: var(--gold);
+            animation: statusPulse 3s ease-in-out infinite;
         }
 
         #status-badge.speaking {
-            background: rgba(168, 85, 247, 0.2);
-            color: #a855f7;
-            animation: pulse 1s infinite;
+            border-color: var(--gold-bright);
+            color: var(--gold-bright);
+            background: rgba(201,168,76,0.1);
+            animation: statusPulse 1.5s ease-in-out infinite;
         }
 
-        @keyframes pulse {
+        @keyframes statusPulse {
             0%, 100% { opacity: 1; }
-            50% { opacity: 0.6; }
+            50% { opacity: 0.5; }
         }
 
+        /* Corner decorations */
+        #overlay::before, #overlay::after {
+            content: '';
+            position: absolute;
+            width: 40px;
+            height: 40px;
+            border-color: var(--gold-dim);
+            border-style: solid;
+            opacity: 0.3;
+        }
+
+        #overlay::before {
+            top: 16px; right: 16px;
+            border-width: 1px 1px 0 0;
+        }
+
+        #overlay::after {
+            bottom: 180px; left: 16px;
+            border-width: 0 0 1px 1px;
+        }
+
+        /* ---- BOTTOM PANEL ---- */
         #bottom-panel {
-            padding: 20px;
-            background: linear-gradient(to top, rgba(0,0,0,0.85), transparent);
+            padding: 16px 24px 28px;
+            background: linear-gradient(to top, rgba(8,8,12,0.95) 0%, rgba(8,8,12,0.7) 50%, transparent 100%);
         }
 
-        #transcript {
-            max-height: 120px;
-            overflow-y: auto;
-            margin-bottom: 16px;
-            padding: 0 4px;
+        /* Waveform */
+        #waveform {
+            height: 32px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 2px;
+            margin-bottom: 12px;
+            opacity: 0.8;
         }
+
+        .wave-bar {
+            width: 2px;
+            background: var(--gold);
+            border-radius: 1px;
+            transition: height 0.08s ease;
+            height: 2px;
+        }
+
+        /* Transcript */
+        #transcript {
+            max-height: 100px;
+            overflow-y: auto;
+            margin-bottom: 20px;
+            padding: 0 2px;
+            scrollbar-width: none;
+        }
+
+        #transcript::-webkit-scrollbar { display: none; }
 
         .transcript-line {
-            font-size: 15px;
-            line-height: 1.5;
-            margin-bottom: 6px;
-            opacity: 0.9;
+            font-family: var(--font-body);
+            font-size: 14px;
+            font-weight: 300;
+            line-height: 1.6;
+            margin-bottom: 4px;
+            animation: fadeIn 0.3s ease;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(4px); }
+            to { opacity: 1; transform: translateY(0); }
         }
 
         .transcript-line.argus {
-            color: #a78bfa;
+            color: var(--gold);
+        }
+
+        .transcript-line.argus::before {
+            content: '◉ ';
+            font-size: 8px;
+            vertical-align: middle;
         }
 
         .transcript-line.user {
-            color: #60a5fa;
+            color: var(--bone-dim);
+            font-style: italic;
         }
 
+        /* Controls */
         #controls {
             display: flex;
             justify-content: center;
             align-items: center;
-            gap: 20px;
+            gap: 24px;
             pointer-events: auto;
         }
 
         .btn {
-            width: 72px;
-            height: 72px;
+            position: relative;
+            width: 56px;
+            height: 56px;
             border-radius: 50%;
-            border: none;
+            border: 1px solid rgba(255,255,255,0.12);
+            background: rgba(255,255,255,0.04);
+            backdrop-filter: blur(12px);
             cursor: pointer;
             display: flex;
             align-items: center;
             justify-content: center;
-            font-size: 28px;
-            transition: all 0.2s;
+            font-size: 20px;
+            transition: all 0.3s ease;
             -webkit-tap-highlight-color: transparent;
+            color: var(--bone);
         }
 
         .btn:active {
-            transform: scale(0.92);
+            transform: scale(0.9);
+        }
+
+        .btn:hover {
+            border-color: rgba(255,255,255,0.25);
+            background: rgba(255,255,255,0.08);
         }
 
         #btn-connect {
-            background: #22c55e;
-            color: white;
-            width: 80px;
-            height: 80px;
-            font-size: 32px;
-            box-shadow: 0 0 30px rgba(34, 197, 94, 0.3);
+            width: 68px;
+            height: 68px;
+            border: 1.5px solid var(--gold);
+            background: transparent;
+            font-size: 24px;
+            color: var(--gold);
+            box-shadow: 0 0 30px rgba(201,168,76,0.1);
+        }
+
+        #btn-connect:hover {
+            background: rgba(201,168,76,0.1);
         }
 
         #btn-connect.active {
-            background: #ef4444;
-            box-shadow: 0 0 30px rgba(239, 68, 68, 0.3);
+            border-color: var(--danger);
+            color: var(--danger);
+            box-shadow: 0 0 30px rgba(196,74,63,0.15);
         }
 
-        #btn-camera {
-            background: rgba(255,255,255,0.15);
-            color: white;
-        }
-
-        #btn-mute {
-            background: rgba(255,255,255,0.15);
-            color: white;
+        #btn-connect.active:hover {
+            background: rgba(196,74,63,0.1);
         }
 
         #btn-mute.muted {
-            background: rgba(239, 68, 68, 0.3);
-            color: #ef4444;
+            border-color: var(--danger);
+            color: var(--danger);
         }
 
-        #start-screen {
+        /* Scanning line animation when listening */
+        .scan-line {
             position: absolute;
-            top: 0; left: 0; right: 0; bottom: 0;
-            background: radial-gradient(ellipse at center, #1a1a2e 0%, #0a0a0f 70%);
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            z-index: 10;
+            left: 0; right: 0;
+            height: 1px;
+            background: linear-gradient(90deg, transparent, var(--gold-dim), transparent);
+            opacity: 0;
+            pointer-events: none;
         }
 
-        #start-screen .logo {
-            font-size: 80px;
-            margin-bottom: 20px;
+        .scan-line.active {
+            animation: scan 3s linear infinite;
+            opacity: 0.3;
         }
 
-        #start-screen h1 {
-            font-size: 36px;
-            font-weight: 800;
-            margin-bottom: 8px;
-            background: linear-gradient(135deg, #a78bfa, #60a5fa);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
+        @keyframes scan {
+            0% { top: 20%; }
+            100% { top: 80%; }
         }
 
-        #start-screen p {
-            color: #666;
-            font-size: 16px;
-            margin-bottom: 40px;
+        /* ---- CROSSHAIR ELEMENT ---- */
+        .crosshair {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: 80px;
+            height: 80px;
+            pointer-events: none;
+            opacity: 0.15;
         }
 
-        #btn-start {
-            padding: 16px 48px;
-            border-radius: 40px;
-            border: none;
-            background: linear-gradient(135deg, #a78bfa, #3b82f6);
-            color: white;
-            font-size: 18px;
-            font-weight: 700;
-            cursor: pointer;
-            pointer-events: auto;
-            transition: all 0.2s;
+        .crosshair::before, .crosshair::after {
+            content: '';
+            position: absolute;
+            background: var(--gold);
         }
 
-        #btn-start:active {
-            transform: scale(0.95);
+        .crosshair::before {
+            top: 50%; left: 0;
+            width: 100%; height: 0.5px;
         }
 
-        #waveform {
-            height: 40px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 3px;
-            margin-bottom: 16px;
+        .crosshair::after {
+            left: 50%; top: 0;
+            width: 0.5px; height: 100%;
         }
 
-        .wave-bar {
-            width: 4px;
-            background: #a78bfa;
-            border-radius: 2px;
-            transition: height 0.1s;
-            height: 4px;
+        .crosshair-circle {
+            position: absolute;
+            top: 50%; left: 50%;
+            width: 40px; height: 40px;
+            border: 0.5px solid var(--gold);
+            border-radius: 50%;
+            transform: translate(-50%, -50%);
         }
 
-        canvas#frame-canvas {
-            display: none;
+        /* ---- RESPONSIVE ---- */
+        @media (max-width: 380px) {
+            #start-screen h1 { font-size: 40px; letter-spacing: 12px; }
+            .btn { width: 48px; height: 48px; font-size: 18px; }
+            #btn-connect { width: 60px; height: 60px; font-size: 22px; }
         }
     </style>
 </head>
 <body>
     <div id="start-screen">
-        <div class="logo">👁️</div>
-        <h1>ARGUS</h1>
-        <p>The All-Seeing Companion</p>
-        <button id="btn-start">Start Argus</button>
+        <div class="eye-symbol">
+            <div class="eye-iris"></div>
+        </div>
+        <h1>Argus</h1>
+        <div class="subtitle">The All-Seeing Companion</div>
+        <button id="btn-start">Awaken</button>
     </div>
 
     <div id="video-container">
         <video id="camera-feed" autoplay playsinline muted></video>
         <canvas id="frame-canvas"></canvas>
 
+        <div class="crosshair">
+            <div class="crosshair-circle"></div>
+        </div>
+
+        <div class="scan-line" id="scan-line"></div>
+
         <div id="overlay">
             <div id="header">
-                <span class="eye">👁️</span>
-                <h1>ARGUS</h1>
-                <span id="status-badge">Offline</span>
+                <div class="header-left">
+                    <h1>Argus</h1>
+                    <span class="tagline">Panoptes · v0.1</span>
+                </div>
+                <span id="status-badge">Dormant</span>
             </div>
 
             <div id="bottom-panel">
                 <div id="waveform"></div>
                 <div id="transcript"></div>
                 <div id="controls">
-                    <button class="btn" id="btn-mute">🎤</button>
-                    <button class="btn" id="btn-connect">📞</button>
-                    <button class="btn" id="btn-camera">🔄</button>
+                    <button class="btn" id="btn-mute" title="Mute">🎤</button>
+                    <button class="btn" id="btn-connect" title="Connect">◉</button>
+                    <button class="btn" id="btn-camera" title="Flip Camera">⟳</button>
                 </div>
             </div>
         </div>
@@ -274,8 +528,6 @@
 
     <script>
         const BACKEND_WS = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
-        // If running locally with separate backend:
-        // const BACKEND_WS = 'ws://localhost:8080/ws';
 
         let ws = null;
         let mediaStream = null;
@@ -287,7 +539,7 @@
         let nextPlayTime = 0;
         let isConnected = false;
         let isMuted = false;
-        let facingMode = 'environment'; // back camera by default
+        let facingMode = 'environment';
         let frameInterval = null;
 
         const startScreen = document.getElementById('start-screen');
@@ -301,9 +553,10 @@
         const btnMute = document.getElementById('btn-mute');
         const btnCamera = document.getElementById('btn-camera');
         const waveform = document.getElementById('waveform');
+        const scanLine = document.getElementById('scan-line');
 
         // Create waveform bars
-        for (let i = 0; i < 20; i++) {
+        for (let i = 0; i < 32; i++) {
             const bar = document.createElement('div');
             bar.className = 'wave-bar';
             waveform.appendChild(bar);
@@ -313,16 +566,16 @@
         function setStatus(status, text) {
             statusBadge.className = status;
             statusBadge.textContent = text;
+            scanLine.classList.toggle('active', status === 'listening');
         }
 
         function addTranscript(text, role) {
             const line = document.createElement('div');
             line.className = `transcript-line ${role}`;
-            line.textContent = role === 'argus' ? `👁️ ${text}` : `🗣️ ${text}`;
+            line.textContent = text;
             transcript.appendChild(line);
             transcript.scrollTop = transcript.scrollHeight;
-            // Keep only last 10 lines
-            while (transcript.children.length > 10) {
+            while (transcript.children.length > 8) {
                 transcript.removeChild(transcript.firstChild);
             }
         }
@@ -342,7 +595,7 @@
                 return true;
             } catch (err) {
                 console.error('Camera/mic error:', err);
-                alert('Argus needs camera and microphone access to work. Please grant permissions and try again.');
+                addTranscript('Camera or microphone access denied.', 'argus');
                 return false;
             }
         }
@@ -351,13 +604,11 @@
             audioContext = new AudioContext({ sampleRate: 16000 });
             const source = audioContext.createMediaStreamSource(mediaStream);
 
-            // Use ScriptProcessor for broad compatibility (AudioWorklet better but needs more setup)
             audioProcessor = audioContext.createScriptProcessor(4096, 1, 1);
             audioProcessor.onaudioprocess = (e) => {
                 if (!ws || ws.readyState !== WebSocket.OPEN || isMuted) return;
 
                 const float32 = e.inputBuffer.getChannelData(0);
-                // Convert float32 to int16 PCM
                 const int16 = new Int16Array(float32.length);
                 for (let i = 0; i < float32.length; i++) {
                     int16[i] = Math.max(-32768, Math.min(32767, Math.floor(float32[i] * 32768)));
@@ -366,7 +617,6 @@
                 const b64 = arrayBufferToBase64(int16.buffer);
                 ws.send(JSON.stringify({ type: 'audio', data: b64 }));
 
-                // Update waveform visualization
                 const rms = Math.sqrt(float32.reduce((sum, v) => sum + v * v, 0) / float32.length);
                 updateWaveform(rms);
             };
@@ -376,7 +626,6 @@
         }
 
         function startVideoCapture() {
-            // Send a video frame every 2 seconds
             canvas.width = 640;
             canvas.height = 480;
 
@@ -394,33 +643,31 @@
             ws = new WebSocket(BACKEND_WS);
 
             ws.onopen = () => {
-                console.log('🔗 WebSocket connected');
+                console.log('WebSocket connected');
                 isConnected = true;
-                setStatus('connected', '● Connected');
+                setStatus('connected', 'Connecting');
                 btnConnect.classList.add('active');
-                btnConnect.textContent = '📵';
+                btnConnect.textContent = '✕';
 
                 startAudioCapture();
                 startVideoCapture();
-
-                setTimeout(() => setStatus('listening', '● Listening'), 1000);
             };
 
             ws.onmessage = (event) => {
                 const msg = JSON.parse(event.data);
 
                 if (msg.type === 'connected') {
-                    setStatus('listening', '● Listening');
-                    addTranscript('Argus is ready. I can see and hear you.', 'argus');
+                    setStatus('listening', 'Observing');
+                    addTranscript('I see you. Speak freely.', 'argus');
                 } else if (msg.type === 'audio') {
-                    setStatus('speaking', '● Speaking');
+                    setStatus('speaking', 'Speaking');
                     playAudio(msg.data);
                 } else if (msg.type === 'text') {
                     addTranscript(msg.data, 'argus');
                 } else if (msg.type === 'turn_complete') {
-                    setStatus('listening', '● Listening');
+                    setStatus('listening', 'Observing');
                 } else if (msg.type === 'error') {
-                    addTranscript('Error: ' + msg.data, 'argus');
+                    addTranscript(msg.data, 'argus');
                     setStatus('', 'Error');
                 }
             };
@@ -432,16 +679,15 @@
 
             ws.onerror = (err) => {
                 console.error('WebSocket error:', err);
-                addTranscript('Connection error. Try again.', 'argus');
                 disconnect();
             };
         }
 
         function disconnect() {
             isConnected = false;
-            setStatus('', 'Offline');
+            setStatus('', 'Dormant');
             btnConnect.classList.remove('active');
-            btnConnect.textContent = '📞';
+            btnConnect.textContent = '◉';
 
             if (frameInterval) clearInterval(frameInterval);
             if (audioProcessor) audioProcessor.disconnect();
@@ -471,7 +717,6 @@
                 const buffer = playbackContext.createBuffer(1, float32.length, 24000);
                 buffer.getChannelData(0).set(float32);
 
-                // Schedule audio chunks sequentially instead of overlapping
                 const now = playbackContext.currentTime;
                 if (nextPlayTime < now) {
                     nextPlayTime = now;
@@ -483,7 +728,6 @@
                 source.start(nextPlayTime);
                 nextPlayTime += buffer.duration;
 
-                // Animate waveform
                 const rms = Math.sqrt(float32.reduce((sum, v) => sum + v * v, 0) / float32.length);
                 updateWaveform(rms * 3);
             } catch (err) {
@@ -493,8 +737,8 @@
 
         function updateWaveform(intensity) {
             const scale = Math.min(intensity * 50, 1);
-            waveBars.forEach((bar, i) => {
-                const h = 4 + Math.random() * scale * 32;
+            waveBars.forEach((bar) => {
+                const h = 2 + Math.random() * scale * 24;
                 bar.style.height = `${h}px`;
             });
         }
@@ -517,11 +761,13 @@
             return bytes.buffer;
         }
 
-        // Event listeners
+        // ---- Event Listeners ----
         btnStart.addEventListener('click', async () => {
             const ok = await startCamera();
             if (ok) {
-                startScreen.style.display = 'none';
+                startScreen.style.opacity = '0';
+                startScreen.style.transition = 'opacity 0.6s ease';
+                setTimeout(() => { startScreen.style.display = 'none'; }, 600);
             }
         });
 
