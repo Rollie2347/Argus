@@ -59,10 +59,12 @@ Built for the [Gemini Live Agent Challenge](https://geminiliveagentchallenge.dev
 |-----------|-----------|
 | AI Model | Gemini 2.5 Flash Native Audio (Live API) |
 | SDK | Google GenAI SDK for Node.js |
+| Agent Tools | 7 custom function declarations (recipes, timers, shopping, etc.) |
 | Backend | Express + WebSocket (Node.js) |
 | Frontend | Vanilla JS PWA (camera + mic) |
 | Hosting | Google Cloud Run |
-| Tunnel (dev) | Cloudflare Tunnel |
+| IaC | Terraform (automated GCP deployment) |
+| Container | Docker |
 
 ---
 
