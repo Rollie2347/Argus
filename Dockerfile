@@ -2,17 +2,17 @@ FROM node:22-slim
 
 WORKDIR /app
 
-# Copy package files and install dependencies
-COPY backend/package.json backend/package-lock.json ./
-RUN npm ci --production
+# Install backend dependencies
+COPY backend/package.json backend/package-lock.json ./backend/
+RUN cd backend && npm ci --omit=dev
 
 # Copy application code
-COPY backend/server.js backend/agents.js ./
+COPY backend/*.js ./backend/
+COPY backend/.env.example ./backend/
 COPY frontend/ ./frontend/
 
-EXPOSE 8080
+WORKDIR /app/backend
 
-ENV NODE_ENV=production
-ENV PORT=8080
+EXPOSE 8080
 
 CMD ["node", "server.js"]
