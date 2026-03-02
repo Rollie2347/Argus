@@ -1,13 +1,29 @@
 /**
- * Argus Agent System
+ * Argus Agent System v0.3
  * 
- * Domain-specific agents with tool functions for the Gemini Live API.
- * Uses Google ADK pattern: orchestrator agent routes to domain sub-agents
- * based on visual context detection.
+ * Multi-domain agent orchestration with persistent memory,
+ * weather awareness, and proactive daily life optimization.
  */
 
+import {
+  initFirestore,
+  getUserMemory,
+  updateUserMemory,
+  addDailyEntry,
+  getDailyLog,
+  getShoppingList,
+  updateShoppingList,
+  addObservation,
+  getRecentObservations,
+  buildMemoryContext,
+} from "./memory.js";
+import { getWeather, weatherToContext } from "./weather.js";
+
+// Initialize Firestore on import
+initFirestore();
+
 // ============================================================
-// TOOL DEFINITIONS (Gemini Function Calling format)
+// TOOL DEFINITIONS
 // ============================================================
 
 export const TOOLS = [
@@ -15,153 +31,152 @@ export const TOOLS = [
     functionDeclarations: [
       {
         name: "identify_scene",
-        description: "Analyze the current camera view to identify what environment or activity the user is in. Call this when you need to understand the context.",
+        description: "Analyze the current camera view to identify the environment or activity. Also stores the observation in memory for future reference.",
         parameters: {
           type: "OBJECT",
           properties: {
             scene_type: {
               type: "STRING",
-              description: "The detected scene type",
-              enum: ["kitchen", "grocery_store", "outdoors", "workshop", "office", "living_room", "vehicle", "unknown"]
+              enum: ["kitchen", "grocery_store", "outdoors", "workshop", "office", "living_room", "vehicle", "bathroom", "bedroom", "restaurant", "unknown"]
             },
-            confidence: {
-              type: "NUMBER",
-              description: "Confidence level 0-1"
-            },
-            objects_detected: {
-              type: "ARRAY",
-              items: { type: "STRING" },
-              description: "Key objects visible in the scene"
-            }
+            confidence: { type: "NUMBER" },
+            objects_detected: { type: "ARRAY", items: { type: "STRING" } },
+            notable_details: { type: "STRING", description: "Anything noteworthy about the scene" }
           },
           required: ["scene_type", "confidence"]
         }
       },
       {
         name: "get_recipe_suggestion",
-        description: "Suggest a recipe based on visible ingredients. Use when in a kitchen and the user asks about cooking or you can see food items.",
+        description: "Suggest a recipe based on visible ingredients. Considers user's dietary preferences and past cooking from memory.",
         parameters: {
           type: "OBJECT",
           properties: {
-            ingredients: {
-              type: "ARRAY",
-              items: { type: "STRING" },
-              description: "List of ingredients visible or mentioned"
-            },
-            cuisine_preference: {
-              type: "STRING",
-              description: "Preferred cuisine type if mentioned"
-            },
-            difficulty: {
-              type: "STRING",
-              enum: ["easy", "medium", "hard"],
-              description: "Desired difficulty level"
-            }
+            ingredients: { type: "ARRAY", items: { type: "STRING" } },
+            cuisine_preference: { type: "STRING" },
+            difficulty: { type: "STRING", enum: ["easy", "medium", "hard"] },
+            time_available_minutes: { type: "NUMBER", description: "How much time the user has" }
           },
           required: ["ingredients"]
         }
       },
       {
         name: "cooking_timer",
-        description: "Set or check a cooking timer. Use when the user needs to time something while cooking.",
+        description: "Set, check, or cancel a cooking timer.",
         parameters: {
           type: "OBJECT",
           properties: {
-            action: {
-              type: "STRING",
-              enum: ["set", "check", "cancel"],
-              description: "Timer action"
-            },
-            duration_minutes: {
-              type: "NUMBER",
-              description: "Timer duration in minutes (for 'set' action)"
-            },
-            label: {
-              type: "STRING",
-              description: "What the timer is for (e.g., 'pasta', 'oven preheat')"
-            }
+            action: { type: "STRING", enum: ["set", "check", "cancel"] },
+            duration_minutes: { type: "NUMBER" },
+            label: { type: "STRING" }
           },
           required: ["action"]
         }
       },
       {
         name: "compare_products",
-        description: "Compare two or more products visible in the camera. Use when shopping and the user is deciding between items.",
+        description: "Compare products visible in the camera. Use when shopping and deciding between items.",
         parameters: {
           type: "OBJECT",
           properties: {
-            products: {
-              type: "ARRAY",
-              items: { type: "STRING" },
-              description: "Product names or descriptions to compare"
-            },
-            criteria: {
-              type: "STRING",
-              description: "What to compare on (price, nutrition, quality, etc.)"
-            }
+            products: { type: "ARRAY", items: { type: "STRING" } },
+            criteria: { type: "STRING" }
           },
           required: ["products"]
         }
       },
       {
         name: "diagnose_problem",
-        description: "Diagnose a visible problem or issue. Use when the user shows you something broken, damaged, or malfunctioning.",
+        description: "Diagnose a visible problem or issue. Use for broken, damaged, or malfunctioning items.",
         parameters: {
           type: "OBJECT",
           properties: {
-            problem_type: {
-              type: "STRING",
-              description: "Type of problem (plumbing, electrical, mechanical, structural, etc.)"
-            },
-            description: {
-              type: "STRING",
-              description: "Description of what you see"
-            },
-            severity: {
-              type: "STRING",
-              enum: ["minor", "moderate", "serious", "emergency"],
-              description: "Estimated severity"
-            }
+            problem_type: { type: "STRING" },
+            description: { type: "STRING" },
+            severity: { type: "STRING", enum: ["minor", "moderate", "serious", "emergency"] }
           },
           required: ["problem_type", "description"]
         }
       },
       {
         name: "read_text",
-        description: "Read and interpret text visible in the camera view. Use for signs, labels, documents, screens, etc.",
+        description: "Read and interpret text visible in the camera (signs, labels, documents, screens, etc.)",
         parameters: {
           type: "OBJECT",
           properties: {
-            text_content: {
-              type: "STRING",
-              description: "The text that was read"
-            },
-            context: {
-              type: "STRING",
-              description: "What type of text it is (sign, label, document, menu, etc.)"
-            }
+            text_content: { type: "STRING" },
+            context: { type: "STRING" }
           },
           required: ["text_content"]
         }
       },
       {
-        name: "update_shopping_list",
-        description: "Add or remove items from the user's shopping list.",
+        name: "manage_shopping_list",
+        description: "Add, remove, or view the persistent shopping list. Remembers across sessions.",
         parameters: {
           type: "OBJECT",
           properties: {
-            action: {
-              type: "STRING",
-              enum: ["add", "remove", "check", "list"],
-              description: "Shopping list action"
-            },
-            items: {
-              type: "ARRAY",
-              items: { type: "STRING" },
-              description: "Items to add or remove"
-            }
+            action: { type: "STRING", enum: ["add", "remove", "check_off", "view"] },
+            items: { type: "ARRAY", items: { type: "STRING" } }
           },
           required: ["action"]
+        }
+      },
+      {
+        name: "remember_preference",
+        description: "Store a user preference or personal detail for future reference. Use when the user mentions dietary restrictions, allergies, favorite foods, their name, or any preference.",
+        parameters: {
+          type: "OBJECT",
+          properties: {
+            category: { type: "STRING", enum: ["dietary", "allergy", "favorite", "dislike", "personal", "routine", "other"] },
+            key: { type: "STRING", description: "What to remember (e.g., 'name', 'allergy', 'favorite_cuisine')" },
+            value: { type: "STRING", description: "The value to store" }
+          },
+          required: ["category", "key", "value"]
+        }
+      },
+      {
+        name: "recall_memory",
+        description: "Retrieve stored information about the user or their day. Use when you need to remember something from earlier.",
+        parameters: {
+          type: "OBJECT",
+          properties: {
+            query_type: { type: "STRING", enum: ["preferences", "today", "shopping_list", "recent_observations", "all"] }
+          },
+          required: ["query_type"]
+        }
+      },
+      {
+        name: "get_weather",
+        description: "Get current weather and forecast. Use for outfit suggestions, activity planning, or when the user asks about weather.",
+        parameters: {
+          type: "OBJECT",
+          properties: {
+            reason: { type: "STRING", description: "Why weather info is needed (e.g., 'outfit suggestion', 'activity planning')" }
+          },
+          required: []
+        }
+      },
+      {
+        name: "log_daily_activity",
+        description: "Log an activity or event that happened today. Helps Argus remember what the user did throughout the day.",
+        parameters: {
+          type: "OBJECT",
+          properties: {
+            activity_type: { type: "STRING", enum: ["meal", "errand", "exercise", "work", "social", "chore", "other"] },
+            summary: { type: "STRING", description: "Brief description of the activity" },
+            details: { type: "STRING" }
+          },
+          required: ["activity_type", "summary"]
+        }
+      },
+      {
+        name: "get_daily_summary",
+        description: "Get a summary of what the user has done today. Use for end-of-day recaps or when context about the day is needed.",
+        parameters: {
+          type: "OBJECT",
+          properties: {},
+          required: []
         }
       }
     ]
@@ -169,97 +184,138 @@ export const TOOLS = [
 ];
 
 // ============================================================
-// TOOL HANDLERS (Server-side execution)
+// TOOL HANDLERS
 // ============================================================
 
-// In-memory state for the session
-const sessionState = {
-  timers: new Map(),
-  shoppingList: [],
-  currentScene: "unknown",
-  conversationContext: [],
-};
+const timers = new Map();
 
-export function handleToolCall(functionCall) {
+export async function handleToolCall(functionCall) {
   const { name, args } = functionCall;
-  
+
   switch (name) {
-    case "identify_scene":
-      sessionState.currentScene = args.scene_type;
+    case "identify_scene": {
+      // Store observation in Firestore
+      await addObservation("default", {
+        scene: args.scene_type,
+        objects: args.objects_detected || [],
+        details: args.notable_details || "",
+      });
       return {
         scene_type: args.scene_type,
         confidence: args.confidence,
         objects: args.objects_detected || [],
-        message: `Scene identified as ${args.scene_type} with ${Math.round((args.confidence || 0) * 100)}% confidence.`
+        stored: true,
+        message: `Scene: ${args.scene_type} (${Math.round((args.confidence || 0) * 100)}% confidence)`
       };
+    }
 
-    case "get_recipe_suggestion":
+    case "get_recipe_suggestion": {
+      const userMem = await getUserMemory("default");
       return {
         ingredients: args.ingredients,
-        suggestion: `Based on ${args.ingredients.join(", ")}, I can help you make something delicious. Let me walk you through it step by step.`,
-        cuisine: args.cuisine_preference || "any",
-        difficulty: args.difficulty || "easy"
+        dietary: userMem.dietaryPreferences || "none specified",
+        allergies: userMem.allergies || "none specified",
+        time: args.time_available_minutes || "not specified",
+        suggestion: `Suggesting recipe with: ${args.ingredients.join(", ")}`,
       };
+    }
 
-    case "cooking_timer":
+    case "cooking_timer": {
       if (args.action === "set") {
         const id = Date.now().toString();
         const endTime = Date.now() + (args.duration_minutes || 5) * 60 * 1000;
-        sessionState.timers.set(id, {
-          label: args.label || "timer",
-          endTime,
-          duration: args.duration_minutes
-        });
-        return {
-          status: "set",
-          label: args.label || "timer",
-          duration_minutes: args.duration_minutes,
-          message: `Timer set for ${args.duration_minutes} minutes for ${args.label || "timer"}.`
-        };
+        timers.set(id, { label: args.label || "timer", endTime, duration: args.duration_minutes });
+        await addDailyEntry("default", { type: "timer_set", summary: `Set ${args.duration_minutes}min timer for ${args.label}` });
+        return { status: "set", label: args.label, duration_minutes: args.duration_minutes };
       } else if (args.action === "check") {
-        const activeTimers = [];
-        for (const [id, timer] of sessionState.timers) {
-          const remaining = Math.max(0, Math.ceil((timer.endTime - Date.now()) / 60000));
-          activeTimers.push({ label: timer.label, remaining_minutes: remaining });
+        const active = [];
+        for (const [id, t] of timers) {
+          const remaining = Math.max(0, Math.ceil((t.endTime - Date.now()) / 60000));
+          if (remaining <= 0) { timers.delete(id); active.push({ label: t.label, status: "DONE!" }); }
+          else active.push({ label: t.label, remaining_minutes: remaining });
         }
-        return { active_timers: activeTimers };
+        return { active_timers: active };
       } else {
-        sessionState.timers.clear();
-        return { status: "cancelled", message: "All timers cancelled." };
+        timers.clear();
+        return { status: "cancelled" };
       }
+    }
 
-    case "compare_products":
-      return {
-        products: args.products,
-        criteria: args.criteria || "overall value",
-        message: `Comparing ${args.products.join(" vs ")} based on ${args.criteria || "overall value"}.`
-      };
+    case "compare_products": {
+      return { products: args.products, criteria: args.criteria || "overall value" };
+    }
 
-    case "diagnose_problem":
-      return {
-        problem_type: args.problem_type,
-        description: args.description,
-        severity: args.severity || "moderate",
-        message: `I see a ${args.severity || "moderate"} ${args.problem_type} issue: ${args.description}.`
-      };
+    case "diagnose_problem": {
+      await addObservation("default", { scene: "problem_detected", type: args.problem_type, description: args.description, severity: args.severity });
+      return { problem_type: args.problem_type, description: args.description, severity: args.severity || "moderate" };
+    }
 
-    case "read_text":
-      return {
-        text: args.text_content,
-        context: args.context || "general",
-        message: `I can see: "${args.text_content}"`
-      };
+    case "read_text": {
+      return { text: args.text_content, context: args.context || "general" };
+    }
 
-    case "update_shopping_list":
+    case "manage_shopping_list": {
+      let list = await getShoppingList("default");
       if (args.action === "add" && args.items) {
-        sessionState.shoppingList.push(...args.items);
-        return { list: sessionState.shoppingList, added: args.items };
+        list = [...new Set([...list, ...args.items])];
+        await updateShoppingList("default", list);
+        return { list, added: args.items };
       } else if (args.action === "remove" && args.items) {
-        sessionState.shoppingList = sessionState.shoppingList.filter(i => !args.items.includes(i));
-        return { list: sessionState.shoppingList, removed: args.items };
+        list = list.filter(i => !args.items.includes(i));
+        await updateShoppingList("default", list);
+        return { list, removed: args.items };
+      } else if (args.action === "check_off" && args.items) {
+        list = list.filter(i => !args.items.includes(i));
+        await updateShoppingList("default", list);
+        await addDailyEntry("default", { type: "shopping", summary: `Bought: ${args.items.join(", ")}` });
+        return { list, checked_off: args.items };
       } else {
-        return { list: sessionState.shoppingList };
+        return { list };
       }
+    }
+
+    case "remember_preference": {
+      const update = {};
+      if (args.category === "dietary") update.dietaryPreferences = args.value;
+      else if (args.category === "allergy") update.allergies = args.value;
+      else if (args.category === "personal" && args.key === "name") update.name = args.value;
+      else {
+        update[`preferences.${args.key}`] = args.value;
+      }
+      await updateUserMemory("default", update);
+      return { stored: true, category: args.category, key: args.key, value: args.value };
+    }
+
+    case "recall_memory": {
+      if (args.query_type === "preferences") return await getUserMemory("default");
+      if (args.query_type === "today") return await getDailyLog("default");
+      if (args.query_type === "shopping_list") return { items: await getShoppingList("default") };
+      if (args.query_type === "recent_observations") return { observations: await getRecentObservations("default", 10) };
+      if (args.query_type === "all") return { memory: await buildMemoryContext("default") };
+      return {};
+    }
+
+    case "get_weather": {
+      const weather = await getWeather();
+      if (weather) {
+        return weather;
+      }
+      return { error: "Weather unavailable" };
+    }
+
+    case "log_daily_activity": {
+      await addDailyEntry("default", {
+        type: args.activity_type,
+        summary: args.summary,
+        details: args.details || "",
+      });
+      return { logged: true, activity: args.summary };
+    }
+
+    case "get_daily_summary": {
+      const log = await getDailyLog("default");
+      return { entries: log.entries || [], count: (log.entries || []).length };
+    }
 
     default:
       return { error: `Unknown tool: ${name}` };
@@ -267,52 +323,88 @@ export function handleToolCall(functionCall) {
 }
 
 // ============================================================
-// SYSTEM INSTRUCTION (Orchestrator Agent)
+// SYSTEM INSTRUCTION
 // ============================================================
 
-export const SYSTEM_INSTRUCTION = `You are Argus, an all-seeing AI life companion named after Argus Panoptes — the hundred-eyed guardian of Greek mythology.
+export async function buildSystemInstruction() {
+  // Build dynamic context from memory + weather
+  const [memoryContext, weather] = await Promise.all([
+    buildMemoryContext("default"),
+    getWeather(),
+  ]);
+  const weatherContext = weatherToContext(weather);
+
+  const now = new Date();
+  const timeStr = now.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", hour12: true, timeZone: "America/Chicago" });
+  const dateStr = now.toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", timeZone: "America/Chicago" });
+
+  return `You are Argus, an all-seeing AI life companion named after Argus Panoptes — the hundred-eyed guardian of Greek mythology.
+
+## CURRENT CONTEXT
+Time: ${timeStr}, ${dateStr}
+${weatherContext}
+${memoryContext ? `\n## USER MEMORY\n${memoryContext}` : ""}
 
 ## ROLE
-You see the user's world through their camera and help with whatever they're doing. You are an orchestrator agent that coordinates specialized capabilities:
+You see the user's world through their camera, hear them naturally, and help optimize their daily life. You are not a chatbot — you are a companion that lives in their world.
 
-### Kitchen Agent
-When you detect a kitchen environment or food-related context:
-- Use get_recipe_suggestion to recommend dishes based on visible ingredients
-- Use cooking_timer to manage cooking times
-- Proactively notice cooking states ("your oil is smoking", "that looks done")
-- Guide step-by-step through recipes
+## DOMAIN AGENTS
 
-### Shopping Agent  
-When you detect a store or shopping context:
-- Use compare_products to help decide between items
-- Use update_shopping_list to track what they need/got
-- Read labels and nutritional info with read_text
-- Help find items and navigate stores
+### 🍳 Kitchen Agent
+- Suggest recipes from visible ingredients (respecting dietary preferences/allergies from memory)
+- Manage cooking timers
+- Proactively notice cooking states ("your oil is smoking", "that looks perfectly browned")
+- Remember what they cooked recently to avoid repetition
 
-### Fix-It Agent
-When you see something broken or a repair context:
-- Use diagnose_problem to assess issues
+### 🛒 Shopping Agent  
+- Manage persistent shopping list (survives across sessions)
+- Compare products when they hold items up
+- Check off items as they shop ("got it!" removes from list)
+- Suggest items based on what you've seen in their kitchen
+
+### 🔧 Fix-It Agent
+- Diagnose visible problems
 - Guide repairs step by step
-- Identify tools needed
-- Warn about safety concerns
+- Identify tools needed and safety concerns
 
-### General Vision Agent
-For everything else:
-- Use read_text to interpret signs, documents, screens
-- Use identify_scene to understand new environments
-- Answer visual questions about anything you see
+### 🌐 General Vision Agent
+- Read text, signs, labels, documents, screens
+- Identify objects, places, and scenes
+- Answer any visual question
+
+### 🧠 Memory Agent
+- Remember personal details (name, preferences, allergies)
+- Track daily activities for end-of-day recaps
+- Store observations for cross-session awareness
+- Build context that makes you smarter over time
+
+### 🌤️ Context Agent
+- Weather-aware suggestions (outfit advice, activity planning)
+- Time-aware help (morning routine vs evening wind-down)
+- Proactive nudges based on what you know and see
+
+## PROACTIVE BEHAVIORS
+You don't just respond — you NOTICE and SPEAK UP:
+- See groceries on the counter → "Want me to help track what you're putting away?"
+- It's getting late + user hasn't eaten → "It's almost 8, want me to suggest a quick dinner?"
+- See car keys → "Don't forget, you mentioned needing to pick up dry cleaning"
+- Weather is bad + they're heading out → "Heads up, it's ${weather ? weather.temperature + '°F and ' + weather.condition : 'cold'} out there"
+- Notice new item in kitchen → "That's new! Want me to add it to your usual inventory?"
 
 ## PERSONALITY
-- Warm, friendly, efficient — like a knowledgeable friend
-- Proactive — point things out before being asked
-- Contextually appropriate — match the energy of the situation  
+- Warm, friendly, efficient — like a knowledgeable friend who happens to see everything
+- Proactive but not nagging — mention things once, don't repeat
+- Contextually appropriate — energetic in the morning, calm in the evening
+- Remembers and references past interactions naturally
 - Slightly witty but never annoying
-- Concise — 1-3 sentences for voice unless more detail is requested
+- Concise — 1-3 sentences for voice unless more detail is needed
 
 ## RULES
-- Keep responses SHORT for voice output
-- Be grounded — if you're not sure what you see, say so
+- Use your tools actively — store memories, log activities, check weather
+- When users mention personal details, ALWAYS use remember_preference to store them
+- Reference memory naturally ("last time you made this..." / "you mentioned you're allergic to...")
+- Keep voice responses SHORT (1-3 sentences)
+- Be grounded — if you can't see clearly, say so
 - Handle interruptions gracefully
-- Use your tools actively — don't just describe, help
-- Remember context within the session
-- When you notice something important, speak up proactively`;
+- When in doubt, be helpful`;
+}

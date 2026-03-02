@@ -10,7 +10,7 @@ import { createServer } from "http";
 import path from "path";
 import { fileURLToPath } from "url";
 import { WebSocketServer, WebSocket } from "ws";
-import { SYSTEM_INSTRUCTION, TOOLS, handleToolCall } from "./agents.js";
+import { buildSystemInstruction, TOOLS, handleToolCall } from "./agents.js";
 
 dotenv.config();
 
@@ -24,7 +24,7 @@ const app = express();
 const server = createServer(app);
 
 app.get("/api/health", (req, res) => {
-  res.json({ status: "ok", name: "Argus", model: MODEL, agents: ["kitchen", "shopping", "fixit", "general"] });
+  res.json({ status: "ok", name: "Argus", version: "0.3", model: MODEL, agents: ["kitchen", "shopping", "fixit", "general", "memory", "context"], services: ["firestore", "weather"] });
 });
 
 // Serve frontend
@@ -46,6 +46,10 @@ wss.on("connection", async (clientWs) => {
   let imageFrames = 0;
 
   try {
+    // Build dynamic system instruction with memory + weather context
+    const systemInstruction = await buildSystemInstruction();
+    console.log("📝 System instruction built with live context");
+
     session = await ai.live.connect({
       model: MODEL,
       config: {
@@ -56,7 +60,7 @@ wss.on("connection", async (clientWs) => {
           },
         },
         systemInstruction: {
-          parts: [{ text: SYSTEM_INSTRUCTION }],
+          parts: [{ text: systemInstruction }],
         },
         tools: TOOLS,
       },
@@ -68,7 +72,7 @@ wss.on("connection", async (clientWs) => {
           }
         },
 
-        onmessage: (msg) => {
+        onmessage: async (msg) => {
           if (clientWs.readyState !== WebSocket.OPEN) return;
 
           try {
@@ -79,13 +83,22 @@ wss.on("connection", async (clientWs) => {
               const functionResponses = [];
 
               for (const fc of functionCalls) {
-                const result = handleToolCall(fc);
-                functionResponses.push({
-                  name: fc.name,
-                  id: fc.id,
-                  response: result,
-                });
-                console.log(`  → ${fc.name}:`, JSON.stringify(result).substring(0, 150));
+                try {
+                  const result = await handleToolCall(fc);
+                  functionResponses.push({
+                    name: fc.name,
+                    id: fc.id,
+                    response: result,
+                  });
+                  console.log(`  → ${fc.name}:`, JSON.stringify(result).substring(0, 150));
+                } catch (toolErr) {
+                  console.error(`  ✗ ${fc.name} error:`, toolErr.message);
+                  functionResponses.push({
+                    name: fc.name,
+                    id: fc.id,
+                    response: { error: toolErr.message },
+                  });
+                }
               }
 
               // Send tool responses back to Gemini
@@ -192,7 +205,8 @@ wss.on("connection", async (clientWs) => {
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`🏛️ Argus v0.2 running on http://0.0.0.0:${PORT}`);
-  console.log(`👁️ Agents: Kitchen | Shopping | Fix-It | General Vision`);
+  console.log(`🏛️ Argus v0.3 running on http://0.0.0.0:${PORT}`);
+  console.log(`👁️ Agents: Kitchen | Shopping | Fix-It | General | Memory | Context`);
   console.log(`🔧 Tools: ${TOOLS[0].functionDeclarations.map(f => f.name).join(", ")}`);
+  console.log(`🧠 Memory: Firestore | 🌤️ Weather: Open-Meteo`);
 });
