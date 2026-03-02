@@ -1,6 +1,6 @@
 /**
  * Argus — The All-Seeing Companion
- * Backend: Express + WebSocket relay to Gemini Live API
+ * Backend: Express + WebSocket relay to Gemini Live API with Tool Calling
  */
 
 import { GoogleGenAI, Modality } from "@google/genai";
@@ -10,6 +10,7 @@ import { createServer } from "http";
 import path from "path";
 import { fileURLToPath } from "url";
 import { WebSocketServer, WebSocket } from "ws";
+import { TOOL_DECLARATIONS, executeTool } from "./agents.js";
 
 dotenv.config();
 
@@ -34,17 +35,35 @@ Your capabilities:
 - You can HEAR the user speaking naturally
 - You can SPEAK back with voice responses
 - You remember context within the current session
+- You have TOOLS for: recipe suggestions, cooking timers, ingredient substitutions, shopping lists, product comparison, object identification, and quick facts
 
-Guidelines:
-- If you see a kitchen/food scenario, offer cooking guidance
-- If you see a store/products, help with shopping decisions
-- If you see a road/driving scenario, help with navigation awareness
-- If you see something broken/a tool, offer fix-it guidance
-- For anything else, be a helpful visual assistant
+DOMAIN AWARENESS:
+When you detect the user is in a KITCHEN or has food/ingredients visible:
+- Proactively offer to help with cooking
+- Use getRecipeSuggestions tool when you see ingredients
+- Use setTimer tool when timing is mentioned
+- Use getSubstitution tool when an ingredient is missing
+
+When you detect the user is SHOPPING (store, products, labels):
+- Help read and compare labels
+- Use addToShoppingList to track what they need
+- Use compareProducts when deciding between options
+
+When you detect OBJECTS, TOOLS, or THINGS TO FIX:
+- Use identifyObject to analyze what you see
+- Offer step-by-step fix-it guidance
+
+For EVERYTHING ELSE:
+- Use getQuickFact for general knowledge
+- Be a helpful visual assistant
+- Read text, signs, labels that the camera sees
+
+IMPORTANT:
 - Always be grounded — if you're not sure what you see, say so
 - Handle interruptions gracefully
 - Keep responses SHORT for voice — 1-3 sentences unless they ask for detail
-- Be proactive about what you see — don't just wait for questions`;
+- Be proactive about what you see — don't just wait for questions
+- When using tools, explain what you're doing naturally in conversation`;
 
 // Express app for serving frontend
 const app = express();
@@ -52,7 +71,7 @@ const server = createServer(app);
 
 // Health check
 app.get("/api/health", (req, res) => {
-  res.json({ status: "ok", name: "Argus", model: MODEL });
+  res.json({ status: "ok", name: "Argus", model: MODEL, tools: TOOL_DECLARATIONS[0].functionDeclarations.length });
 });
 
 // Serve frontend
@@ -84,6 +103,7 @@ wss.on("connection", async (clientWs) => {
         systemInstruction: {
           parts: [{ text: SYSTEM_INSTRUCTION }],
         },
+        tools: TOOL_DECLARATIONS,
       },
       callbacks: {
         onopen: () => {
@@ -97,13 +117,28 @@ wss.on("connection", async (clientWs) => {
           if (clientWs.readyState !== WebSocket.OPEN) return;
 
           try {
-            // Log what we got
-            const keys = Object.keys(msg || {});
-            console.log(`📨 Gemini msg keys: [${keys.join(", ")}]`, 
-              msg.data ? `data: ${typeof msg.data} (${String(msg.data).length} chars)` : "",
-              msg.text ? `text: "${msg.text.substring(0, 80)}"` : "",
-              msg.serverContent ? `serverContent: ${JSON.stringify(Object.keys(msg.serverContent))}` : ""
-            );
+            // Handle tool calls from Gemini
+            if (msg.toolCall) {
+              console.log("🔧 Tool call:", JSON.stringify(msg.toolCall).substring(0, 200));
+              
+              const functionResponses = [];
+              for (const fc of msg.toolCall.functionCalls || []) {
+                console.log(`  → Executing: ${fc.name}(${JSON.stringify(fc.args)})`);
+                const result = executeTool(fc.name, fc.args);
+                console.log(`  ← Result: ${JSON.stringify(result).substring(0, 200)}`);
+                functionResponses.push({
+                  name: fc.name,
+                  id: fc.id,
+                  response: result,
+                });
+              }
+              
+              // Send tool results back to Gemini
+              if (session && functionResponses.length > 0) {
+                session.sendToolResponse({ functionResponses });
+              }
+              return;
+            }
 
             // Audio response from Gemini
             if (msg.data) {
@@ -120,10 +155,7 @@ wss.on("connection", async (clientWs) => {
             }
 
             // Turn complete
-            if (
-              msg.serverContent &&
-              msg.serverContent.turnComplete
-            ) {
+            if (msg.serverContent && msg.serverContent.turnComplete) {
               clientWs.send(JSON.stringify({ type: "turn_complete" }));
             }
           } catch (err) {
@@ -141,7 +173,7 @@ wss.on("connection", async (clientWs) => {
         },
 
         onclose: (ev) => {
-          console.log("Gemini session closed", ev ? JSON.stringify(ev).substring(0, 200) : "no event");
+          console.log("Gemini session closed", ev ? JSON.stringify(ev).substring(0, 200) : "");
           if (clientWs.readyState === WebSocket.OPEN) {
             clientWs.close();
           }
@@ -149,7 +181,7 @@ wss.on("connection", async (clientWs) => {
       },
     });
 
-    console.log("✅ Gemini session established");
+    console.log("✅ Gemini session established with", TOOL_DECLARATIONS[0].functionDeclarations.length, "tools");
 
     // Receive from client → send to Gemini
     let audioChunks = 0;
@@ -162,7 +194,7 @@ wss.on("connection", async (clientWs) => {
         if (msg.type === "audio" && session) {
           audioChunks++;
           if (audioChunks % 50 === 1) {
-            console.log(`🎤 Audio chunk #${audioChunks} (size: ${msg.data.length} b64 chars)`);
+            console.log(`🎤 Audio chunk #${audioChunks}`);
           }
           session.sendRealtimeInput({
             media: {
@@ -172,7 +204,7 @@ wss.on("connection", async (clientWs) => {
           });
         } else if (msg.type === "image" && session) {
           imageChunks++;
-          console.log(`📷 Image frame #${imageChunks} (size: ${msg.data.length} b64 chars)`);
+          console.log(`📷 Image frame #${imageChunks}`);
           session.sendRealtimeInput({
             media: {
               data: msg.data,
@@ -217,4 +249,5 @@ wss.on("connection", async (clientWs) => {
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`🏛️ Argus backend running on http://0.0.0.0:${PORT}`);
   console.log(`👁️ WebSocket endpoint: ws://0.0.0.0:${PORT}/ws`);
+  console.log(`🔧 Tools loaded: ${TOOL_DECLARATIONS[0].functionDeclarations.map(t => t.name).join(', ')}`);
 });

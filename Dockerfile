@@ -1,15 +1,18 @@
-FROM python:3.12-slim
+FROM node:22-slim
 
 WORKDIR /app
 
-COPY backend/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Copy package files and install dependencies
+COPY backend/package.json backend/package-lock.json ./
+RUN npm ci --production
 
-COPY backend/ ./backend/
-COPY frontend/index.html ./frontend/dist/index.html
-
-WORKDIR /app/backend
+# Copy application code
+COPY backend/server.js backend/agents.js ./
+COPY frontend/ ./frontend/
 
 EXPOSE 8080
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+ENV NODE_ENV=production
+ENV PORT=8080
+
+CMD ["node", "server.js"]
