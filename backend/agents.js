@@ -178,6 +178,18 @@ export const TOOLS = [
           properties: {},
           required: []
         }
+      },
+      {
+        name: "get_restaurant_website",
+        description: "Look up the official website for a specific restaurant.",
+        parameters: {
+          type: "OBJECT",
+          properties: {
+            restaurant_name: { type: "STRING", description: "The name of the restaurant" },
+            location: { type: "STRING", description: "City or area (optional)" }
+          },
+          required: ["restaurant_name"]
+        }
       }
     ]
   }
@@ -188,6 +200,18 @@ export const TOOLS = [
 // ============================================================
 
 const timers = new Map();
+
+async function lookupRestaurantWebsite(name, loc) {
+  const q=encodeURIComponent(loc?name+" restaurant "+loc:name+" restaurant official website");
+  try {
+    const res=await fetch("https://api.duckduckgo.com/?q="+q+"&format=json&no_html=1",{headers:{"User-Agent":"Argus/1.0"},signal:AbortSignal.timeout(5000)});
+    const d=await res.json();
+    if(d.AbstractURL&&d.AbstractURL.trim()) return {website:d.AbstractURL,source:"knowledge_graph"};
+    if(d.Results&&d.Results[0]&&d.Results[0].FirstURL) return {website:d.Results[0].FirstURL,source:"search_result"};
+    if(d.RelatedTopics&&d.RelatedTopics[0]&&d.RelatedTopics[0].FirstURL) return {website:d.RelatedTopics[0].FirstURL,source:"related_topic"};
+  } catch(e){console.warn("DDG failed:",e.message);}
+  return {website:"https://www.google.com/maps/search/"+encodeURIComponent(loc?name+" "+loc:name),source:"maps_fallback"};
+}
 
 export async function handleToolCall(functionCall) {
   const { name, args } = functionCall;
@@ -317,6 +341,15 @@ export async function handleToolCall(functionCall) {
       return { entries: log.entries || [], count: (log.entries || []).length };
     }
 
+    case "get_restaurant_website": {
+      const {restaurant_name,location}=args;
+      console.log("Lookup website:",restaurant_name);
+      const r=await lookupRestaurantWebsite(restaurant_name,location);
+      const loc=location?" in "+location:"";
+      return {restaurant:restaurant_name,location:location||null,website:r.website,source:r.source,
+        message:r.source==="maps_fallback"?"Could not find official website for "+restaurant_name+loc+". Google Maps: "+r.website:"Website for "+restaurant_name+loc+": "+r.website};
+    }
+
     default:
       return { error: `Unknown tool: ${name}` };
   }
@@ -366,6 +399,12 @@ You see the user's world through their camera, hear them naturally, and help opt
 - Diagnose visible problems
 - Guide repairs step by step
 - Identify tools needed and safety concerns
+
+### 🍽️ Restaurant Agent
+When the user asks about a specific restaurant:
+- Use get_restaurant_website to look up the official website
+- Always share the link so the user can visit directly
+- Include location if mentioned for more accurate results
 
 ### 🌐 General Vision Agent
 - Read text, signs, labels, documents, screens
