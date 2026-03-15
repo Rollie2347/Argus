@@ -28,6 +28,24 @@ variable "gemini_api_key" {
   sensitive   = true
 }
 
+variable "weather_lat" {
+  description = "Latitude for weather (default: Chicago)"
+  type        = string
+  default     = "41.88"
+}
+
+variable "weather_lon" {
+  description = "Longitude for weather (default: Chicago)"
+  type        = string
+  default     = "-87.63"
+}
+
+variable "timezone" {
+  description = "Timezone for time-aware responses"
+  type        = string
+  default     = "America/Chicago"
+}
+
 provider "google" {
   project = var.project_id
   region  = var.region
@@ -44,6 +62,10 @@ resource "google_project_service" "artifactregistry" {
 
 resource "google_project_service" "cloudbuild" {
   service = "cloudbuild.googleapis.com"
+}
+
+resource "google_project_service" "firestore" {
+  service = "firestore.googleapis.com"
 }
 
 # Artifact Registry for Docker images
@@ -76,6 +98,21 @@ resource "google_cloud_run_v2_service" "argus" {
       env {
         name  = "GCP_PROJECT_ID"
         value = var.project_id
+      }
+
+      env {
+        name  = "WEATHER_LAT"
+        value = var.weather_lat
+      }
+
+      env {
+        name  = "WEATHER_LON"
+        value = var.weather_lon
+      }
+
+      env {
+        name  = "TIMEZONE"
+        value = var.timezone
       }
 
       resources {

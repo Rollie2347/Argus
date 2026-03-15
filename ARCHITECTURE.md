@@ -40,17 +40,17 @@
 │  │  │       Domain Agent Tools                │       │       │
 │  │  │                                         │       │       │
 │  │  │  🍳 Kitchen Agent                      │       │       │
-│  │  │    • getRecipeSuggestions()             │       │       │
-│  │  │    • setTimer()                         │       │       │
-│  │  │    • getSubstitution()                  │       │       │
+│  │  │    • get_recipe_suggestion()             │       │       │
+│  │  │    • cooking_timer()                         │       │       │
+│  │  │    • remember_preference()                  │       │       │
 │  │  │                                         │       │       │
 │  │  │  🛒 Shopping Agent                     │       │       │
-│  │  │    • addToShoppingList()               │       │       │
-│  │  │    • compareProducts()                  │       │       │
+│  │  │    • manage_shopping_list()               │       │       │
+│  │  │    • compare_products()                  │       │       │
 │  │  │                                         │       │       │
 │  │  │  🌐 General Agent                      │       │       │
-│  │  │    • identifyObject()                   │       │       │
-│  │  │    • getQuickFact()                     │       │       │
+│  │  │    • identify_scene()                   │       │       │
+│  │  │    • web_search()                     │       │       │
 │  │  └────────────────────────────────────────┘       │       │
 │  └──────────────────────┬────────────────────────────┘       │
 │                         │                                     │

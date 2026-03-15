@@ -19,12 +19,26 @@ const PORT = process.env.PORT || 8080;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const MODEL = "gemini-2.5-flash-native-audio-preview-12-2025";
 
+// Validate required env vars at startup
+if (!GEMINI_API_KEY) {
+  console.error("FATAL: GEMINI_API_KEY is not set. Set it in your .env file or environment.");
+  process.exit(1);
+}
+
 // Express app
 const app = express();
 const server = createServer(app);
 
 app.get("/api/health", (req, res) => {
-  res.json({ status: "ok", name: "Argus", version: "0.3", model: MODEL, agents: ["kitchen", "shopping", "fixit", "general", "memory", "context"], services: ["firestore", "weather"] });
+  const tools = TOOLS[0].functionDeclarations.map(f => f.name);
+  res.json({
+    status: "ok", name: "Argus", version: "0.3", model: MODEL,
+    agents: ["kitchen", "shopping", "fixit", "restaurant", "search", "memory", "context"],
+    tools: tools, toolCount: tools.length,
+    services: ["firestore", "weather", "web-search"],
+    location: { lat: process.env.WEATHER_LAT || "41.88", lon: process.env.WEATHER_LON || "-87.63" },
+    timezone: process.env.TIMEZONE || "America/Chicago",
+  });
 });
 
 // Serve frontend

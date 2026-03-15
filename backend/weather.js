@@ -6,8 +6,10 @@ let cachedWeather = null;
 let cacheTime = 0;
 const CACHE_DURATION = 30 * 60 * 1000; // 30 min
 
-export async function getWeather(lat = 41.88, lon = -87.63) {
-  // Default: Chicago (Central Time)
+export async function getWeather(
+  lat = parseFloat(process.env.WEATHER_LAT) || 41.88,
+  lon = parseFloat(process.env.WEATHER_LON) || -87.63
+) {
   const now = Date.now();
   if (cachedWeather && now - cacheTime < CACHE_DURATION) {
     return cachedWeather;

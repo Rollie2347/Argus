@@ -5,7 +5,7 @@
  * remembers across sessions and throughout the day.
  */
 
-import { Firestore } from "@google-cloud/firestore";
+import { Firestore, FieldValue } from "@google-cloud/firestore";
 import path from "path";
 import { fileURLToPath } from "url";
 
@@ -76,7 +76,7 @@ export async function addDailyEntry(userId = "default", entry) {
       .doc(today)
       .set(
         {
-          entries: Firestore.FieldValue.arrayUnion({
+          entries: FieldValue.arrayUnion({
             ...entry,
             timestamp: new Date().toISOString(),
           }),

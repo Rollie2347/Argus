@@ -5,3 +5,6 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+node_modules/
+service-account.json
+*.log

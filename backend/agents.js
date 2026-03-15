@@ -180,6 +180,18 @@ export const TOOLS = [
         }
       },
       {
+        name: "web_search",
+        description: "Search the web for current facts, how-to guides, product info, or any real-world information. Use for grounding responses with accurate up-to-date data.",
+        parameters: {
+          type: "OBJECT",
+          properties: {
+            query: { type: "STRING", description: "Search query" },
+            context: { type: "STRING", description: "Why this info is needed" }
+          },
+          required: ["query"]
+        }
+      },
+      {
         name: "get_restaurant_website",
         description: "Look up the official website for a specific restaurant.",
         parameters: {
@@ -341,6 +353,21 @@ export async function handleToolCall(functionCall) {
       return { entries: log.entries || [], count: (log.entries || []).length };
     }
 
+    case "web_search": {
+      const { query } = args;
+      console.log("Web search:", query);
+      try {
+        const q=encodeURIComponent(query);
+        const r=await fetch("https://api.duckduckgo.com/?q="+q+"&format=json&no_html=1&skip_disambig=1",{headers:{"User-Agent":"Argus/1.0"},signal:AbortSignal.timeout(5000)});
+        const d=await r.json();
+        const results=[];
+        if(d.AbstractText) results.push(d.AbstractText);
+        if(d.Answer) results.push(d.Answer);
+        (d.RelatedTopics||[]).slice(0,3).forEach(t=>{if(t.Text) results.push(t.Text);});
+        return {query,results:results.slice(0,3),abstract:d.AbstractText||null,answer:d.Answer||null,source:d.AbstractSource||null};
+      } catch(e) { return {query,error:e.message,results:[]}; }
+    }
+
     case "get_restaurant_website": {
       const {restaurant_name,location}=args;
       console.log("Lookup website:",restaurant_name);
@@ -368,8 +395,8 @@ export async function buildSystemInstruction() {
   const weatherContext = weatherToContext(weather);
 
   const now = new Date();
-  const timeStr = now.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", hour12: true, timeZone: "America/Chicago" });
-  const dateStr = now.toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", timeZone: "America/Chicago" });
+  const timeStr = now.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", hour12: true, timeZone: process.env.TIMEZONE || "America/Chicago" });
+  const dateStr = now.toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", timeZone: process.env.TIMEZONE || "America/Chicago" });
 
   return `You are Argus, an all-seeing AI life companion named after Argus Panoptes — the hundred-eyed guardian of Greek mythology.
 
@@ -399,6 +426,12 @@ You see the user's world through their camera, hear them naturally, and help opt
 - Diagnose visible problems
 - Guide repairs step by step
 - Identify tools needed and safety concerns
+
+### 🔍 Web Search Agent
+When you need real-world information to give accurate advice:
+- Use web_search to ground responses with current facts
+- Product how-to guides, repair instructions, nutritional info
+- Any factual question where accuracy matters
 
 ### 🍽️ Restaurant Agent
 When the user asks about a specific restaurant:
