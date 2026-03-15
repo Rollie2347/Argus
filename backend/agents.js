@@ -19,8 +19,10 @@ import {
 } from "./memory.js";
 import { getWeather, weatherToContext } from "./weather.js";
 
-// Initialize Firestore on import
-initFirestore();
+// Initialize Firestore (async — errors are caught inside initFirestore)
+initFirestore().then(ok => {
+  if (!ok) console.warn("Memory disabled — Argus will not remember across sessions");
+});
 
 // ============================================================
 // TOOL DEFINITIONS

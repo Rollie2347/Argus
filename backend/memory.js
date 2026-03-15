@@ -6,34 +6,27 @@
  */
 
 import { Firestore, FieldValue } from "@google-cloud/firestore";
+import { existsSync } from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-let db;
-
-export function initFirestore() {
+let db;export async function initFirestore() {
+  const projectId = process.env.GCP_PROJECT_ID || "agus-488919";
+  const saPath = path.join(__dirname, "service-account.json");
   try {
-    const saPath = path.join(__dirname, "service-account.json");
-    db = new Firestore({
-      projectId: process.env.GCP_PROJECT_ID || "agus-488919",
-      keyFilename: saPath,
-    });
-    console.log("🧠 Firestore connected — memory online");
+    db = existsSync(saPath)
+      ? new Firestore({ projectId, keyFilename: saPath })
+      : new Firestore({ projectId });
+    // Test connection early so we know immediately if creds work
+    await db.collection("_health").limit(1).get();
+    console.log("Firestore connected and verified");
     return true;
-  } catch (err) {
-    // On Cloud Run, use default credentials
-    try {
-      db = new Firestore({
-        projectId: process.env.GCP_PROJECT_ID || "agus-488919",
-      });
-      console.log("🧠 Firestore connected (default creds)");
-      return true;
-    } catch (e) {
-      console.warn("⚠️ Firestore unavailable, running without memory:", e.message);
-      return false;
-    }
+  } catch (e) {
+    console.warn("Firestore unavailable, running without memory:", e.message);
+    db = null;
+    return false;
   }
 }
 
