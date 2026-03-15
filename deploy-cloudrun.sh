@@ -1,9 +1,6 @@
 #!/bin/bash
-# Deploy Argus to Google Cloud Run
-# Usage: ./deploy-cloudrun.sh <GEMINI_API_KEY> [WEATHER_LAT] [WEATHER_LON] [TIMEZONE]
-
+# Deploy Argus to Cloud Run with full Firestore memory setup
 set -e
-
 PROJECT_ID="agus-488919"
 REGION="us-central1"
 SERVICE_NAME="argus"
@@ -11,35 +8,41 @@ GEMINI_API_KEY="${1:-$GEMINI_API_KEY}"
 WEATHER_LAT="${2:-${WEATHER_LAT:-41.88}}"
 WEATHER_LON="${3:-${WEATHER_LON:--87.63}}"
 TIMEZONE="${4:-${TIMEZONE:-America/Chicago}}"
-
 if [ -z "$GEMINI_API_KEY" ]; then
-    echo "Usage: ./deploy-cloudrun.sh <GEMINI_API_KEY> [WEATHER_LAT] [WEATHER_LON] [TIMEZONE]"
-    echo "Or set GEMINI_API_KEY environment variable"
-    exit 1
+  echo "Usage: ./deploy-cloudrun.sh <GEMINI_API_KEY>"
+  exit 1
 fi
-
-echo "🏛️ Deploying Argus to Cloud Run..."
-echo "   Project:  $PROJECT_ID"
-echo "   Region:   $REGION"
-echo "   Service:  $SERVICE_NAME"
-echo "   Location: $WEATHER_LAT, $WEATHER_LON ($TIMEZONE)"
-
-# Configure project
+echo "Deploying Argus v0.3..."
+echo "  Project: $PROJECT_ID | Region: $REGION"
 gcloud config set project $PROJECT_ID
-
-# Enable required APIs
-echo "📦 Enabling APIs..."
-gcloud services enable \n    run.googleapis.com \n    artifactregistry.googleapis.com \n    cloudbuild.googleapis.com \n    firestore.googleapis.com
-
-# Deploy directly from source (Cloud Build handles the Docker image)
-echo "🚀 Deploying to Cloud Run..."
-gcloud run deploy $SERVICE_NAME \n    --source . \n    --region $REGION \n    --allow-unauthenticated \n    --set-env-vars "GEMINI_API_KEY=$GEMINI_API_KEY,GCP_PROJECT_ID=$PROJECT_ID,WEATHER_LAT=$WEATHER_LAT,WEATHER_LON=$WEATHER_LON,TIMEZONE=$TIMEZONE" \n    --port 8080 \n    --memory 512Mi \n    --cpu 1 \n    --min-instances 0 \n    --max-instances 10 \n    --timeout 3600 \n    --session-affinity
-
-# Get the URL
-URL=$(gcloud run services describe $SERVICE_NAME --region $REGION --format='value(status.url)')
+# Enable APIs
+echo "Enabling APIs..."
+gcloud services enable run.googleapis.com artifactregistry.googleapis.com cloudbuild.googleapis.com firestore.googleapis.com
+# Create Firestore database (skips if already exists)
+echo "Setting up Firestore..."
+gcloud firestore databases create --location=us-central --type=firestore-native 2>/dev/null || echo "(Firestore already exists)"
+# Grant Cloud Run service account Firestore access
+echo "Granting Firestore permissions..."
+PROJECT_NUMBER=$(gcloud projects describe $PROJECT_ID --format="value(projectNumber)")
+SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+gcloud projects add-iam-policy-binding $PROJECT_ID --member="serviceAccount:$SA" --role="roles/datastore.user" --condition=None 2>/dev/null || true
+echo "  Service account $SA granted datastore.user"
+# Deploy
+echo "Deploying to Cloud Run..."
+gcloud run deploy $SERVICE_NAME \
+  --source . \
+  --region $REGION \
+  --allow-unauthenticated \
+  --set-env-vars "GEMINI_API_KEY=$GEMINI_API_KEY,GCP_PROJECT_ID=$PROJECT_ID,WEATHER_LAT=$WEATHER_LAT,WEATHER_LON=$WEATHER_LON,TIMEZONE=$TIMEZONE" \
+  --port 8080 \
+  --memory 512Mi \
+  --cpu 1 \
+  --min-instances 0 \
+  --max-instances 10 \
+  --timeout 3600 \
+  --session-affinity
+URL=$(gcloud run services describe $SERVICE_NAME --region $REGION --format="value(status.url)")
 echo ""
-echo "✅ Argus deployed successfully!"
-echo "🌐 URL: $URL"
-echo ""
-echo "Test: curl $URL/api/health"
-echo "Open in browser: $URL"
+echo "Argus deployed!"
+echo "URL: $URL"
+echo "Open on your phone: $URL"
