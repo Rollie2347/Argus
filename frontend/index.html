@@ -355,6 +355,19 @@
             font-style: italic;
         }
 
+        .transcript-line.tool {
+            color: var(--gold-dim);
+            font-size: 11px;
+            font-family: var(--font-mono);
+            opacity: 0.6;
+            letter-spacing: 0.03em;
+        }
+
+        .transcript-line.tool::before {
+            content: "⚙ ";
+            font-size: 9px;
+        }
+
         /* Controls */
         #controls {
             display: flex;
@@ -649,8 +662,14 @@
                 btnConnect.classList.add('active');
                 btnConnect.textContent = '✕';
 
+                // Per-user memory ID
+                let uid=localStorage.getItem("argus_uid")||null;
+                if(!uid){uid="u_"+Math.random().toString(36).substr(2,9);localStorage.setItem("argus_uid",uid);}
+                ws.send(JSON.stringify({type:"user_id",id:uid}));
                 startAudioCapture();
                 startVideoCapture();
+                // Proactive greeting
+                setTimeout(()=>{if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:"greet"}));},1200);
             };
 
             ws.onmessage = (event) => {
@@ -666,9 +685,11 @@
                     addTranscript(msg.data, 'argus');
                 } else if (msg.type === 'turn_complete') {
                     setStatus('listening', 'Observing');
-                } else if (msg.type === 'error') {
-                    addTranscript(msg.data, 'argus');
-                    setStatus('', 'Error');
+                } else if (msg.type === "tool_event") {
+                    addTranscript(msg.tool, "tool");
+                } else if (msg.type === "error") {
+                    addTranscript(msg.data, "argus");
+                    setStatus("", "Error");
                 }
             };
 

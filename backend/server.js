@@ -10,7 +10,7 @@ import { createServer } from "http";
 import path from "path";
 import { fileURLToPath } from "url";
 import { WebSocketServer, WebSocket } from "ws";
-import { buildSystemInstruction, TOOLS, handleToolCall } from "./agents.js";
+import { buildSystemInstruction, TOOLS, handleToolCall, setUserId } from "./agents.js";
 
 dotenv.config();
 
@@ -51,8 +51,20 @@ app.use(express.static(frontendPath));
 // WebSocket server
 const wss = new WebSocketServer({ server, path: "/ws" });
 
-wss.on("connection", async (clientWs) => {
+wss.on("connection", async (clientWs, req) => {
   console.log("👁️ Client connected");
+
+  // Auto-detect user location via IP for personalised weather + context
+  const ip = ((req.headers["x-forwarded-for"] || req.socket.remoteAddress) + "").split(",")[0].trim();
+  let userLat = parseFloat(process.env.WEATHER_LAT) || 41.88;
+  let userLon = parseFloat(process.env.WEATHER_LON) || -87.63;
+  let userCity = process.env.WEATHER_CITY || "your area";
+  if (ip && !ip.includes("127.0.0.1") && !ip.includes("::1")) {
+    try {
+      const geo = await (await fetch("https://ipapi.co/" + ip + "/json/", { signal: AbortSignal.timeout(3000) })).json();
+      if (geo.latitude) { userLat = geo.latitude; userLon = geo.longitude; userCity = [geo.city, geo.region_code].filter(Boolean).join(", ") || "your area"; console.log("📍 Location:", userCity); }
+    } catch (e) { console.warn("Geolocation failed:", e.message); }
+  }
 
   const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
   let session = null;
@@ -60,8 +72,8 @@ wss.on("connection", async (clientWs) => {
   let imageFrames = 0;
 
   try {
-    // Build dynamic system instruction with memory + weather context
-    const systemInstruction = await buildSystemInstruction();
+    // Build dynamic system instruction with live memory, weather + location context
+    const systemInstruction = await buildSystemInstruction(userLat, userLon, userCity);
     console.log("📝 System instruction built with live context");
 
     session = await ai.live.connect({
@@ -105,6 +117,9 @@ wss.on("connection", async (clientWs) => {
                     response: result,
                   });
                   console.log(`  → ${fc.name}:`, JSON.stringify(result).substring(0, 150));
+                  if (clientWs.readyState === WebSocket.OPEN) {
+                    clientWs.send(JSON.stringify({ type: "tool_event", tool: fc.name }));
+                  }
                 } catch (toolErr) {
                   console.error(`  ✗ ${fc.name} error:`, toolErr.message);
                   functionResponses.push({
@@ -179,6 +194,13 @@ wss.on("connection", async (clientWs) => {
               mimeType: "audio/pcm;rate=16000",
             },
           });
+        } else if (msg.type === "user_id" && msg.id) {
+          setUserId(msg.id);
+          console.log("👤 User:", msg.id);
+        } else if (msg.type === "greet" && session) {
+          try {
+            session.sendClientContent({ turns: [{ role: "user", parts: [{ text: "greet" }] }], turnComplete: true });
+          } catch (e) { console.warn("Greet failed:", e.message); }
         } else if (msg.type === "image" && session) {
           imageFrames++;
           console.log(`📷 Frame #${imageFrames}`);

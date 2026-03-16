@@ -214,6 +214,8 @@ export const TOOLS = [
 // ============================================================
 
 const timers = new Map();
+let currentUserId = "default";
+export function setUserId(id) { if (id && typeof id === "string") currentUserId = id; }
 
 async function lookupRestaurantWebsite(name, loc) {
   const q=encodeURIComponent(loc?name+" restaurant "+loc:name+" restaurant official website");
@@ -233,7 +235,7 @@ export async function handleToolCall(functionCall) {
   switch (name) {
     case "identify_scene": {
       // Store observation in Firestore
-      await addObservation("default", {
+      await addObservation(currentUserId, {
         scene: args.scene_type,
         objects: args.objects_detected || [],
         details: args.notable_details || "",
@@ -248,7 +250,7 @@ export async function handleToolCall(functionCall) {
     }
 
     case "get_recipe_suggestion": {
-      const userMem = await getUserMemory("default");
+      const userMem = await getUserMemory(currentUserId);
       return {
         ingredients: args.ingredients,
         dietary: userMem.dietaryPreferences || "none specified",
@@ -263,7 +265,7 @@ export async function handleToolCall(functionCall) {
         const id = Date.now().toString();
         const endTime = Date.now() + (args.duration_minutes || 5) * 60 * 1000;
         timers.set(id, { label: args.label || "timer", endTime, duration: args.duration_minutes });
-        await addDailyEntry("default", { type: "timer_set", summary: `Set ${args.duration_minutes}min timer for ${args.label}` });
+        await addDailyEntry(currentUserId, { type: "timer_set", summary: `Set ${args.duration_minutes}min timer for ${args.label}` });
         return { status: "set", label: args.label, duration_minutes: args.duration_minutes };
       } else if (args.action === "check") {
         const active = [];
@@ -284,7 +286,7 @@ export async function handleToolCall(functionCall) {
     }
 
     case "diagnose_problem": {
-      await addObservation("default", { scene: "problem_detected", type: args.problem_type, description: args.description, severity: args.severity });
+      await addObservation(currentUserId, { scene: "problem_detected", type: args.problem_type, description: args.description, severity: args.severity });
       return { problem_type: args.problem_type, description: args.description, severity: args.severity || "moderate" };
     }
 
@@ -293,19 +295,19 @@ export async function handleToolCall(functionCall) {
     }
 
     case "manage_shopping_list": {
-      let list = await getShoppingList("default");
+      let list = await getShoppingList(currentUserId);
       if (args.action === "add" && args.items) {
         list = [...new Set([...list, ...args.items])];
-        await updateShoppingList("default", list);
+        await updateShoppingList(currentUserId, list);
         return { list, added: args.items };
       } else if (args.action === "remove" && args.items) {
         list = list.filter(i => !args.items.includes(i));
-        await updateShoppingList("default", list);
+        await updateShoppingList(currentUserId, list);
         return { list, removed: args.items };
       } else if (args.action === "check_off" && args.items) {
         list = list.filter(i => !args.items.includes(i));
-        await updateShoppingList("default", list);
-        await addDailyEntry("default", { type: "shopping", summary: `Bought: ${args.items.join(", ")}` });
+        await updateShoppingList(currentUserId, list);
+        await addDailyEntry(currentUserId, { type: "shopping", summary: `Bought: ${args.items.join(", ")}` });
         return { list, checked_off: args.items };
       } else {
         return { list };
@@ -320,16 +322,16 @@ export async function handleToolCall(functionCall) {
       else {
         update[`preferences.${args.key}`] = args.value;
       }
-      await updateUserMemory("default", update);
+      await updateUserMemory(currentUserId, update);
       return { stored: true, category: args.category, key: args.key, value: args.value };
     }
 
     case "recall_memory": {
-      if (args.query_type === "preferences") return await getUserMemory("default");
-      if (args.query_type === "today") return await getDailyLog("default");
-      if (args.query_type === "shopping_list") return { items: await getShoppingList("default") };
-      if (args.query_type === "recent_observations") return { observations: await getRecentObservations("default", 10) };
-      if (args.query_type === "all") return { memory: await buildMemoryContext("default") };
+      if (args.query_type === "preferences") return await getUserMemory(currentUserId);
+      if (args.query_type === "today") return await getDailyLog(currentUserId);
+      if (args.query_type === "shopping_list") return { items: await getShoppingList(currentUserId) };
+      if (args.query_type === "recent_observations") return { observations: await getRecentObservations(currentUserId, 10) };
+      if (args.query_type === "all") return { memory: await buildMemoryContext(currentUserId) };
       return {};
     }
 
@@ -342,7 +344,7 @@ export async function handleToolCall(functionCall) {
     }
 
     case "log_daily_activity": {
-      await addDailyEntry("default", {
+      await addDailyEntry(currentUserId, {
         type: args.activity_type,
         summary: args.summary,
         details: args.details || "",
@@ -351,7 +353,7 @@ export async function handleToolCall(functionCall) {
     }
 
     case "get_daily_summary": {
-      const log = await getDailyLog("default");
+      const log = await getDailyLog(currentUserId);
       return { entries: log.entries || [], count: (log.entries || []).length };
     }
 
@@ -388,11 +390,11 @@ export async function handleToolCall(functionCall) {
 // SYSTEM INSTRUCTION
 // ============================================================
 
-export async function buildSystemInstruction() {
+export async function buildSystemInstruction(lat, lon, city) {
   // Build dynamic context from memory + weather
   const [memoryContext, weather] = await Promise.all([
-    buildMemoryContext("default"),
-    getWeather(),
+    buildMemoryContext(currentUserId),
+    getWeather(lat, lon),
   ]);
   const weatherContext = weatherToContext(weather);
 
@@ -404,6 +406,7 @@ export async function buildSystemInstruction() {
 
 ## CURRENT CONTEXT
 Time: ${timeStr}, ${dateStr}
+Location: ${city || "unknown location"}
 ${weatherContext}
 ${memoryContext ? `\n## USER MEMORY\n${memoryContext}` : ""}
 
