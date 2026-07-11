@@ -177,8 +177,9 @@ export default function Home() {
         { text: "Cancel", style: "cancel" },
         { text: "Delete", style: "destructive", onPress: async () => {
           disconnect();
-          await deleteAccount(user.id);
-          router.replace("/sign-in");
+          const ok = await deleteAccount(user.id);
+          if (ok) router.replace("/sign-in");
+          else Alert.alert("Couldn't delete data", "Something went wrong. Check your connection and try again.");
         } },
       ]
     );
