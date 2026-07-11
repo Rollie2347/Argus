@@ -214,8 +214,6 @@ export const TOOLS = [
 // ============================================================
 
 const timers = new Map();
-let currentUserId = "default";
-export function setUserId(id) { if (id && typeof id === "string") currentUserId = id; }
 
 async function lookupRestaurantWebsite(name, loc) {
   const q=encodeURIComponent(loc?name+" restaurant "+loc:name+" restaurant official website");
@@ -229,13 +227,13 @@ async function lookupRestaurantWebsite(name, loc) {
   return {website:"https://www.google.com/maps/search/"+encodeURIComponent(loc?name+" "+loc:name),source:"maps_fallback"};
 }
 
-export async function handleToolCall(functionCall) {
+export async function handleToolCall(functionCall, userId) {
   const { name, args } = functionCall;
 
   switch (name) {
     case "identify_scene": {
       // Store observation in Firestore
-      await addObservation(currentUserId, {
+      await addObservation(userId, {
         scene: args.scene_type,
         objects: args.objects_detected || [],
         details: args.notable_details || "",
@@ -250,7 +248,7 @@ export async function handleToolCall(functionCall) {
     }
 
     case "get_recipe_suggestion": {
-      const userMem = await getUserMemory(currentUserId);
+      const userMem = await getUserMemory(userId);
       return {
         ingredients: args.ingredients,
         dietary: userMem.dietaryPreferences || "none specified",
@@ -265,7 +263,7 @@ export async function handleToolCall(functionCall) {
         const id = Date.now().toString();
         const endTime = Date.now() + (args.duration_minutes || 5) * 60 * 1000;
         timers.set(id, { label: args.label || "timer", endTime, duration: args.duration_minutes });
-        await addDailyEntry(currentUserId, { type: "timer_set", summary: `Set ${args.duration_minutes}min timer for ${args.label}` });
+        await addDailyEntry(userId, { type: "timer_set", summary: `Set ${args.duration_minutes}min timer for ${args.label}` });
         return { status: "set", label: args.label, duration_minutes: args.duration_minutes };
       } else if (args.action === "check") {
         const active = [];
@@ -286,7 +284,7 @@ export async function handleToolCall(functionCall) {
     }
 
     case "diagnose_problem": {
-      await addObservation(currentUserId, { scene: "problem_detected", type: args.problem_type, description: args.description, severity: args.severity });
+      await addObservation(userId, { scene: "problem_detected", type: args.problem_type, description: args.description, severity: args.severity });
       return { problem_type: args.problem_type, description: args.description, severity: args.severity || "moderate" };
     }
 
@@ -295,19 +293,19 @@ export async function handleToolCall(functionCall) {
     }
 
     case "manage_shopping_list": {
-      let list = await getShoppingList(currentUserId);
+      let list = await getShoppingList(userId);
       if (args.action === "add" && args.items) {
         list = [...new Set([...list, ...args.items])];
-        await updateShoppingList(currentUserId, list);
+        await updateShoppingList(userId, list);
         return { list, added: args.items };
       } else if (args.action === "remove" && args.items) {
         list = list.filter(i => !args.items.includes(i));
-        await updateShoppingList(currentUserId, list);
+        await updateShoppingList(userId, list);
         return { list, removed: args.items };
       } else if (args.action === "check_off" && args.items) {
         list = list.filter(i => !args.items.includes(i));
-        await updateShoppingList(currentUserId, list);
-        await addDailyEntry(currentUserId, { type: "shopping", summary: `Bought: ${args.items.join(", ")}` });
+        await updateShoppingList(userId, list);
+        await addDailyEntry(userId, { type: "shopping", summary: `Bought: ${args.items.join(", ")}` });
         return { list, checked_off: args.items };
       } else {
         return { list };
@@ -322,16 +320,16 @@ export async function handleToolCall(functionCall) {
       else {
         update[`preferences.${args.key}`] = args.value;
       }
-      await updateUserMemory(currentUserId, update);
+      await updateUserMemory(userId, update);
       return { stored: true, category: args.category, key: args.key, value: args.value };
     }
 
     case "recall_memory": {
-      if (args.query_type === "preferences") return await getUserMemory(currentUserId);
-      if (args.query_type === "today") return await getDailyLog(currentUserId);
-      if (args.query_type === "shopping_list") return { items: await getShoppingList(currentUserId) };
-      if (args.query_type === "recent_observations") return { observations: await getRecentObservations(currentUserId, 10) };
-      if (args.query_type === "all") return { memory: await buildMemoryContext(currentUserId) };
+      if (args.query_type === "preferences") return await getUserMemory(userId);
+      if (args.query_type === "today") return await getDailyLog(userId);
+      if (args.query_type === "shopping_list") return { items: await getShoppingList(userId) };
+      if (args.query_type === "recent_observations") return { observations: await getRecentObservations(userId, 10) };
+      if (args.query_type === "all") return { memory: await buildMemoryContext(userId) };
       return {};
     }
 
@@ -344,7 +342,7 @@ export async function handleToolCall(functionCall) {
     }
 
     case "log_daily_activity": {
-      await addDailyEntry(currentUserId, {
+      await addDailyEntry(userId, {
         type: args.activity_type,
         summary: args.summary,
         details: args.details || "",
@@ -353,7 +351,7 @@ export async function handleToolCall(functionCall) {
     }
 
     case "get_daily_summary": {
-      const log = await getDailyLog(currentUserId);
+      const log = await getDailyLog(userId);
       return { entries: log.entries || [], count: (log.entries || []).length };
     }
 
@@ -390,10 +388,10 @@ export async function handleToolCall(functionCall) {
 // SYSTEM INSTRUCTION
 // ============================================================
 
-export async function buildSystemInstruction(lat, lon, city) {
+export async function buildSystemInstruction(lat, lon, city, userId) {
   // Build dynamic context from memory + weather
   const [memoryContext, weather] = await Promise.all([
-    buildMemoryContext(currentUserId),
+    buildMemoryContext(userId),
     getWeather(lat, lon),
   ]);
   const weatherContext = weatherToContext(weather);

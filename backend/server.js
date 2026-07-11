@@ -10,7 +10,7 @@ import { createServer } from "http";
 import path from "path";
 import { fileURLToPath } from "url";
 import { WebSocketServer, WebSocket } from "ws";
-import { buildSystemInstruction, TOOLS, handleToolCall, setUserId } from "./agents.js";
+import { buildSystemInstruction, TOOLS, handleToolCall } from "./agents.js";
 
 dotenv.config();
 
@@ -51,8 +51,37 @@ app.use(express.static(frontendPath));
 // WebSocket server
 const wss = new WebSocketServer({ server, path: "/ws" });
 
+// Both known clients (frontend/index.html, mobile/services/websocket.ts) send
+// {type:"user_id", id, name} as their first message right after the socket opens.
+// We need it before building per-user context, so wait for it (bounded by a
+// timeout) instead of racing ahead with a stale/default id.
+function waitForUserId(clientWs, timeoutMs = 3000) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (id) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      clientWs.off("message", onMessage);
+      resolve(id);
+    };
+    const timer = setTimeout(() => finish("default"), timeoutMs);
+    function onMessage(raw) {
+      try {
+        const msg = JSON.parse(raw.toString());
+        if (msg.type === "user_id" && msg.id) finish(msg.id);
+      } catch (_) {}
+    }
+    clientWs.on("message", onMessage);
+  });
+}
+
 wss.on("connection", async (clientWs, req) => {
   console.log("👁️ Client connected");
+
+  // Start listening for the client's user_id immediately, before any other
+  // awaits below, so the message isn't missed.
+  const userIdPromise = waitForUserId(clientWs);
 
   // Auto-detect user location via IP for personalised weather + context
   const ip = ((req.headers["x-forwarded-for"] || req.socket.remoteAddress) + "").split(",")[0].trim();
@@ -66,6 +95,9 @@ wss.on("connection", async (clientWs, req) => {
     } catch (e) { console.warn("Geolocation failed:", e.message); }
   }
 
+  let userId = await userIdPromise;
+  console.log("👤 User:", userId);
+
   const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
   let session = null;
   let audioChunks = 0;
@@ -73,7 +105,7 @@ wss.on("connection", async (clientWs, req) => {
 
   try {
     // Build dynamic system instruction with live memory, weather + location context
-    const systemInstruction = await buildSystemInstruction(userLat, userLon, userCity);
+    const systemInstruction = await buildSystemInstruction(userLat, userLon, userCity, userId);
     console.log("📝 System instruction built with live context");
 
     session = await ai.live.connect({
@@ -110,7 +142,7 @@ wss.on("connection", async (clientWs, req) => {
 
               for (const fc of functionCalls) {
                 try {
-                  const result = await handleToolCall(fc);
+                  const result = await handleToolCall(fc, userId);
                   functionResponses.push({
                     name: fc.name,
                     id: fc.id,
@@ -195,7 +227,7 @@ wss.on("connection", async (clientWs, req) => {
             },
           });
         } else if (msg.type === "user_id" && msg.id) {
-          setUserId(msg.id);
+          userId = msg.id;
           console.log("👤 User:", msg.id);
         } else if (msg.type === "greet" && session) {
           try {

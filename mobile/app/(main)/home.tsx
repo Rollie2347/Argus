@@ -11,11 +11,43 @@ type Status = "dormant"|"connecting"|"observing"|"speaking"|"error";
 type Line = { text: string; role: "argus"|"user"|"tool" };
 
 const CHUNK_MS = 1000;
+const FRAME_MS = 2000;
 
 async function getAudioB64(uri: string): Promise<string> {
   const r = await fetch(uri);
   const buf = await r.arrayBuffer();
   const bytes = new Uint8Array(buf);
+  let bin = "";
+  bytes.forEach(b => bin += String.fromCharCode(b));
+  return btoa(bin);
+}
+
+// Gemini sends raw PCM16 mono @ 24kHz; expo-av can only load audio files/URIs,
+// so wrap each chunk in a minimal WAV header before handing it to Audio.Sound.
+function pcmToWavBase64(pcmB64: string, sampleRate: number): string {
+  const pcmBin = atob(pcmB64);
+  const pcmLen = pcmBin.length;
+  const headerLen = 44;
+  const buf = new ArrayBuffer(headerLen + pcmLen);
+  const view = new DataView(buf);
+  const writeStr = (offset: number, str: string) => { for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i)); };
+
+  writeStr(0, "RIFF");
+  view.setUint32(4, 36 + pcmLen, true);
+  writeStr(8, "WAVE");
+  writeStr(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeStr(36, "data");
+  view.setUint32(40, pcmLen, true);
+
+  const bytes = new Uint8Array(buf);
+  for (let i = 0; i < pcmLen; i++) bytes[headerLen + i] = pcmBin.charCodeAt(i);
   let bin = "";
   bytes.forEach(b => bin += String.fromCharCode(b));
   return btoa(bin);
@@ -32,6 +64,10 @@ export default function Home() {
   const recordingRef = useRef<Audio.Recording|null>(null);
   const loopRef = useRef<boolean>(false);
   const cameraRef = useRef<CameraView>(null);
+  const frameIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const audioQueueRef = useRef<string[]>([]);
+  const isPlayingRef = useRef(false);
+  const soundRef = useRef<Audio.Sound | null>(null);
 
   function addLine(text: string, role: Line["role"]) {
     setLines(prev => [...prev.slice(-20), { text, role }]);
@@ -42,9 +78,9 @@ export default function Home() {
     if (msg.type === "connected") setStatus("observing");
     else if (msg.type === "text") { addLine(msg.data, "argus"); setStatus("observing"); }
     else if (msg.type === "tool_event") addLine(msg.tool, "tool");
-    else if (msg.type === "audio") setStatus("speaking");
+    else if (msg.type === "audio") { setStatus("speaking"); enqueueAudio(msg.data); }
     else if (msg.type === "turn_complete") setStatus("observing");
-    else if (msg.type === "disconnected") { setStatus("dormant"); socketRef.current = null; stopAudio(); }
+    else if (msg.type === "disconnected") { setStatus("dormant"); socketRef.current = null; stopAudio(); stopFrameLoop(); stopPlayback(); }
     else if (msg.type === "error") { addLine(msg.data, "argus"); setStatus("error"); }
   }
 
@@ -72,6 +108,52 @@ export default function Home() {
 
   function stopAudio() { loopRef.current = false; try { recordingRef.current?.stopAndUnloadAsync(); } catch {} recordingRef.current = null; }
 
+  function startFrameLoop() {
+    stopFrameLoop();
+    frameIntervalRef.current = setInterval(async () => {
+      if (!cameraRef.current || !socketRef.current?.ready) return;
+      try {
+        const photo = await cameraRef.current.takePictureAsync({ base64: true, quality: 0.5, skipProcessing: true });
+        if (photo?.base64 && socketRef.current?.ready) socketRef.current.sendImage(photo.base64);
+      } catch (e) { /* camera transiently busy — skip this tick */ }
+    }, FRAME_MS);
+  }
+
+  function stopFrameLoop() { if (frameIntervalRef.current) { clearInterval(frameIntervalRef.current); frameIntervalRef.current = null; } }
+
+  function enqueueAudio(b64: string) {
+    audioQueueRef.current.push(b64);
+    playNextInQueue();
+  }
+
+  async function playNextInQueue() {
+    if (isPlayingRef.current) return;
+    const next = audioQueueRef.current.shift();
+    if (!next) return;
+    isPlayingRef.current = true;
+    try {
+      const wavB64 = pcmToWavBase64(next, 24000);
+      const { sound } = await Audio.Sound.createAsync({ uri: `data:audio/wav;base64,${wavB64}` }, { shouldPlay: true });
+      soundRef.current = sound;
+      sound.setOnPlaybackStatusUpdate((st) => {
+        if (st.isLoaded && st.didJustFinish) {
+          sound.unloadAsync();
+          isPlayingRef.current = false;
+          playNextInQueue();
+        }
+      });
+    } catch (e) {
+      isPlayingRef.current = false;
+      playNextInQueue();
+    }
+  }
+
+  function stopPlayback() {
+    audioQueueRef.current = [];
+    isPlayingRef.current = false;
+    if (soundRef.current) { try { soundRef.current.unloadAsync(); } catch {} soundRef.current = null; }
+  }
+
   useEffect(() => { getStoredUser().then(u => { if (!u) router.replace("/sign-in"); else setUser(u); }); Audio.requestPermissionsAsync(); }, []);
 
   async function connect() {
@@ -81,10 +163,10 @@ export default function Home() {
     const sock = new ArgusSocket(handleMsg, user.id, user.name);
     socketRef.current = sock;
     sock.connect();
-    setTimeout(() => { startAudioLoop(); }, 1500);
+    setTimeout(() => { startAudioLoop(); startFrameLoop(); }, 1500);
   }
 
-  function disconnect() { stopAudio(); socketRef.current?.disconnect(); socketRef.current = null; setStatus("dormant"); }
+  function disconnect() { stopAudio(); stopFrameLoop(); stopPlayback(); socketRef.current?.disconnect(); socketRef.current = null; setStatus("dormant"); }
 
   const connected = status !== "dormant" && status !== "error";
   const statusLabel: Record<Status,string> = { dormant:"Dormant", connecting:"Connecting", observing:"Observing", speaking:"Speaking", error:"Error" };

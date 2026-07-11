@@ -2,17 +2,18 @@
  * Argus Weather Service — Open-Meteo (no API key needed)
  */
 
-let cachedWeather = null;
-let cacheTime = 0;
+const weatherCache = new Map(); // "lat,lon" (rounded) -> { data, time }
 const CACHE_DURATION = 30 * 60 * 1000; // 30 min
 
 export async function getWeather(
   lat = parseFloat(process.env.WEATHER_LAT) || 41.88,
   lon = parseFloat(process.env.WEATHER_LON) || -87.63
 ) {
+  const cacheKey = `${lat.toFixed(2)},${lon.toFixed(2)}`;
   const now = Date.now();
-  if (cachedWeather && now - cacheTime < CACHE_DURATION) {
-    return cachedWeather;
+  const cached = weatherCache.get(cacheKey);
+  if (cached && now - cached.time < CACHE_DURATION) {
+    return cached.data;
   }
 
   try {
@@ -32,7 +33,7 @@ export async function getWeather(
       81: "heavy rain showers", 95: "thunderstorm",
     };
 
-    cachedWeather = {
+    const weather = {
       temperature: Math.round(current.temperature_2m),
       condition: weatherCodes[current.weathercode] || "unknown",
       humidity: current.relative_humidity_2m,
@@ -45,9 +46,9 @@ export async function getWeather(
       tomorrowLow: Math.round(daily.temperature_2m_min[1]),
       tomorrowCondition: weatherCodes[daily.weathercode[1]] || "unknown",
     };
-    cacheTime = now;
+    weatherCache.set(cacheKey, { data: weather, time: now });
 
-    return cachedWeather;
+    return weather;
   } catch (err) {
     console.error("Weather fetch error:", err.message);
     return null;
