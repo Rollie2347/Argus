@@ -1,9 +1,9 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { View, Text, TouchableOpacity, StyleSheet, ScrollView, SafeAreaView } from "react-native";
+import { View, Text, TouchableOpacity, StyleSheet, ScrollView, SafeAreaView, Alert } from "react-native";
 import { CameraView, useCameraPermissions } from "expo-camera";
 import { Audio } from "expo-av";
 import { router } from "expo-router";
-import { getStoredUser, signOut } from "../../services/auth";
+import { getStoredUser, signOut, deleteAccount } from "../../services/auth";
 import { ArgusSocket } from "../../services/websocket";
 import type { User } from "../../services/auth";
 
@@ -168,6 +168,22 @@ export default function Home() {
 
   function disconnect() { stopAudio(); stopFrameLoop(); stopPlayback(); socketRef.current?.disconnect(); socketRef.current = null; setStatus("dormant"); }
 
+  function confirmDeleteData() {
+    if (!user) return;
+    Alert.alert(
+      "Delete my data",
+      "This permanently deletes everything Argus remembers about you. This can't be undone.",
+      [
+        { text: "Cancel", style: "cancel" },
+        { text: "Delete", style: "destructive", onPress: async () => {
+          disconnect();
+          await deleteAccount(user.id);
+          router.replace("/sign-in");
+        } },
+      ]
+    );
+  }
+
   const connected = status !== "dormant" && status !== "error";
   const statusLabel: Record<Status,string> = { dormant:"Dormant", connecting:"Connecting", observing:"Observing", speaking:"Speaking", error:"Error" };
 
@@ -176,9 +192,14 @@ export default function Home() {
       <View style={s.header}>
         <Text style={s.logo}>◉ ARGUS</Text>
         <Text style={s.greeting}>{user ? "Hi, " + user.name.split(" ")[0] : ""}</Text>
-        <TouchableOpacity onPress={async () => { disconnect(); await signOut(); router.replace("/sign-in"); }}>
-          <Text style={s.signOut}>Sign out</Text>
-        </TouchableOpacity>
+        <View style={s.headerActions}>
+          <TouchableOpacity onPress={confirmDeleteData}>
+            <Text style={s.deleteData}>Delete my data</Text>
+          </TouchableOpacity>
+          <TouchableOpacity onPress={async () => { disconnect(); await signOut(); router.replace("/sign-in"); }}>
+            <Text style={s.signOut}>Sign out</Text>
+          </TouchableOpacity>
+        </View>
       </View>
       {connected && camPerm?.granted ? (
         <CameraView ref={cameraRef} style={s.camera} facing="back" />
@@ -207,6 +228,8 @@ const s = StyleSheet.create({
   header:{flexDirection:"row",alignItems:"center",justifyContent:"space-between",paddingHorizontal:20,paddingTop:8,paddingBottom:12},
   logo:{color:"#c9a84c",fontSize:18,fontWeight:"700",letterSpacing:4},
   greeting:{color:"#e8e0d0",fontSize:14},
+  headerActions:{flexDirection:"row",alignItems:"center",gap:14},
+  deleteData:{color:"#c44a3f",fontSize:11},
   signOut:{color:"#9e978a",fontSize:12},
   camera:{flex:1,maxHeight:260},
   camPlaceholder:{height:260,alignItems:"center",justifyContent:"center",backgroundColor:"#111118"},

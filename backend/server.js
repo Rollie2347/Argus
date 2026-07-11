@@ -11,6 +11,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { WebSocketServer, WebSocket } from "ws";
 import { buildSystemInstruction, TOOLS, handleToolCall } from "./agents.js";
+import { deleteUserData, claimUserSecret, verifyDeviceSecret } from "./memory.js";
 
 dotenv.config();
 
@@ -41,10 +42,42 @@ app.get("/api/health", (req, res) => {
   });
 });
 
+// Mints a one-time bearer secret for a fresh userId. Only succeeds the first
+// time a given userId is claimed, so it can't be used to steal an existing
+// user's credential — see claimUserSecret in memory.js.
+app.post("/api/user/:userId/claim", async (req, res) => {
+  try {
+    const secret = await claimUserSecret(req.params.userId);
+    if (!secret) return res.status(409).json({ error: "already claimed" });
+    res.json({ secret });
+  } catch (err) {
+    console.error("Claim user secret error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete("/api/user/:userId", async (req, res) => {
+  const authHeader = req.headers.authorization || "";
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+  if (!(await verifyDeviceSecret(req.params.userId, token))) {
+    return res.status(403).json({ error: "forbidden" });
+  }
+  try {
+    await deleteUserData(req.params.userId);
+    res.json({ status: "deleted" });
+  } catch (err) {
+    console.error("Delete user data error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Serve frontend
 const frontendPath = path.join(__dirname, "..", "frontend");
 app.get("/", (req, res) => {
   res.sendFile(path.join(frontendPath, "index.html"));
+});
+app.get("/privacy", (req, res) => {
+  res.sendFile(path.join(frontendPath, "privacy.html"));
 });
 app.use(express.static(frontendPath));
 

@@ -1,4 +1,4 @@
-const BACKEND = process.env.EXPO_PUBLIC_BACKEND_URL || "https://argus-5fc4xacgzq-uc.a.run.app";
+export const BACKEND = process.env.EXPO_PUBLIC_BACKEND_URL || "https://argus-5fc4xacgzq-uc.a.run.app";
 const WS_URL = BACKEND.replace("https://","wss://").replace("http://","ws://") + "/ws";
 
 export type MsgHandler = (msg: any) => void;

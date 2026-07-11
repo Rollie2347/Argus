@@ -9,6 +9,7 @@ import { Firestore, FieldValue } from "@google-cloud/firestore";
 import { existsSync } from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import crypto from "crypto";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -154,6 +155,47 @@ export async function getRecentObservations(userId = "default", limit = 10) {
   } catch (err) {
     return [];
   }
+}
+
+// ============================================================
+// DEVICE SECRET — Bearer credential bound to a userId, minted once
+// on first use so later destructive calls (e.g. delete) can be
+// authorized instead of trusting the self-asserted userId alone.
+// ============================================================
+
+export async function claimUserSecret(userId) {
+  if (!db) return null;
+  const ref = db.collection("users").doc(userId);
+  return db.runTransaction(async (tx) => {
+    const doc = await tx.get(ref);
+    if (doc.exists && doc.data().deviceSecret) return null; // already claimed
+    const secret = crypto.randomBytes(32).toString("hex");
+    tx.set(ref, { deviceSecret: secret }, { merge: true });
+    return secret;
+  });
+}
+
+export async function verifyDeviceSecret(userId, secret) {
+  if (!db || !secret) return false;
+  try {
+    const doc = await db.collection("users").doc(userId).get();
+    const stored = doc.exists ? doc.data().deviceSecret : null;
+    if (!stored) return false;
+    const a = Buffer.from(stored);
+    const b = Buffer.from(secret);
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  } catch {
+    return false;
+  }
+}
+
+// ============================================================
+// DELETE — Wipe all stored data for a user
+// ============================================================
+
+export async function deleteUserData(userId) {
+  if (!db) return;
+  await db.recursiveDelete(db.collection("users").doc(userId));
 }
 
 // ============================================================
