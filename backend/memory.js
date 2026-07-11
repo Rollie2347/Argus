@@ -168,7 +168,7 @@ export async function claimUserSecret(userId) {
   const ref = db.collection("users").doc(userId);
   return db.runTransaction(async (tx) => {
     const doc = await tx.get(ref);
-    if (doc.exists && doc.data().deviceSecret) return null; // already claimed
+    if (doc.exists) return null; // pre-existing doc (legacy or claimed) — never claimable by a stranger
     const secret = crypto.randomBytes(32).toString("hex");
     tx.set(ref, { deviceSecret: secret }, { merge: true });
     return secret;
