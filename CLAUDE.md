@@ -22,7 +22,6 @@ Argus/
 ├── frontend/index.html  # Vanilla JS PWA — most complete camera/audio path, use this to validate changes
 ├── frontend/privacy.html # Privacy policy, served at GET /privacy — required for App Store Connect
 ├── mobile/             # Expo/React Native app — newer surface, not feature-complete (see below)
-├── deploy/              # Present in repo; not documented in README
 ├── terraform/main.tf   # IaC for Cloud Run + Firestore
 ├── Dockerfile
 ├── deploy-cloudrun.sh
@@ -32,7 +31,7 @@ Argus/
 
 ## Commands
 
-No lint or test suite is configured anywhere in this repo (no test framework in `backend/package.json` or `mobile/package.json`, no CI beyond the Claude Code review/assistant workflows in `.github/workflows/`). Verify changes by running the backend and exercising the WebSocket flow through `frontend/index.html`, not by looking for a test command that doesn't exist.
+No lint is configured anywhere in this repo, and mobile still has no test suite (no CI beyond the Claude Code review/assistant workflows in `.github/workflows/`). `backend/` has a minimal smoke suite added 2026-07-12 — see `npm test` below. For everything beyond that, verify changes by running the backend and exercising the WebSocket flow through `frontend/index.html`.
 
 **Backend**
 ```bash
@@ -41,9 +40,12 @@ npm install
 cp .env.example .env   # set GEMINI_API_KEY, GCP_PROJECT_ID at minimum
 npm start               # node server.js — http://localhost:8080
 npm run dev              # node --watch server.js — auto-restart on change
+npm test                 # node --test "test/**/*.test.js" — smoke tests, see below
 cloudflared tunnel --url http://localhost:8080   # HTTPS tunnel, required for phone camera/mic testing
 ```
 Local dev also needs a Firestore `backend/service-account.json` (gitignored). Cloud Run uses default credentials instead.
+
+`npm test` runs `backend/test/server.smoke.test.js`: spawns the server with a throwaway `GEMINI_API_KEY`/`WS_SHARED_SECRET`/no real Firestore creds, then checks `GET /api/health` and the WS auth gate (missing secret / wrong secret / correct secret, asserting the 4001 close behavior). It does **not** exercise a real Gemini Live round trip — that needs a real API key and would cost money on every test run, so it's deliberately out of scope. Run a single file directly with `node --test test/server.smoke.test.js` if needed; on this checkout, `node --test test/` (directory form, no glob) failed to resolve on Windows/Git Bash — use the quoted glob form from the npm script instead.
 
 **Mobile (Expo)**
 ```bash
@@ -84,27 +86,43 @@ Hardcoded project `agus-488919`; enables Cloud Run/Artifact Registry/Cloud Build
 7. ~~Mobile dependency versions needed real SDK 54 alignment~~ — **Fixed 2026-07-11, `npm install` completed and verified 2026-07-12:** `mobile/package.json` had declared `expo: ~54.0.0` / `app.json` had `sdkVersion: 54.0.0` while every sibling native module and `package-lock.json` were still fully on a consistent SDK 52 tree — an inconsistent half-migrated state that would very likely have broken `eas build`. Fixed by bumping every Expo-bundled native module to the versions pinned in `expo@54.0.0`'s `bundledNativeModules.json`. `npm install` has since actually been run (`mobile/node_modules` exists) and `npx expo-doctor` passes 18/18 checks; the install also surfaced two missing `expo-router` peer deps (`expo-constants`, `expo-linking`), now added to `package.json`. **Still not verified on a real device/simulator** — that's the one thing that requires your physical iPhone, see Session status below.
 8. ~~Unused `@google/adk` dependency and never-installed `backend/node_modules`~~ — **Fixed 2026-07-12:** `@google/adk` was never imported anywhere (only referenced in a `server.js` comment) but pulled in the entire ADK dependency tree (`@mikro-orm/*`, `hono`, `sqlite3`, `mariadb`, etc.), accounting for 41 of 58 `npm audit` findings including both criticals. Removed it; `backend/node_modules` had also never been installed in this checkout — ran `npm install`, confirmed `node server.js` resolves all imports and fails cleanly only on the expected missing-`GEMINI_API_KEY` check. Backend audit findings now 6 moderate (deep transitive `uuid`/`gaxios` deps of `@google-cloud/firestore`, no fix without a breaking major bump — not worth forcing). Also fixed: root `.gitignore`'s `mobile/.env` line had been appended as UTF-16LE at some point (likely a PowerShell append with default encoding) and never actually matched anything — rewrote the file as plain UTF-8. No behavior change in practice since `mobile/.gitignore` already had its own working `.env` entry covering the same path.
 9. ~~WebSocket endpoint had zero auth, rate limiting, or input validation~~ — **Fixed 2026-07-12, see the Architecture section above for the mechanism.** This was the highest-severity finding of the session: the repo is public and the live Cloud Run WS URL was hardcoded in `mobile/services/websocket.ts` as a fallback default, so the unauthenticated endpoint was already effectively public. Verified live with a throwaway local secret: unauthenticated/wrong-secret WS connections get closed (code `4001`) before any Gemini session opens; correctly-authenticated ones proceed normally.
+10. ~~`deploy/` (`deploy/deploy.sh`, `deploy/main.tf`) was a stale duplicate that predated the `WS_SHARED_SECRET` work~~ — **Removed 2026-07-12.** It diffed against `deploy-cloudrun.sh`/`terraform/main.tf` as missing the `ws_shared_secret` variable entirely and using an older argument order (`PROJECT_ID API_KEY`, no secret) — deploying through it would have stood up the Cloud Run service with the WS endpoint unauthenticated again. Confirmed unreferenced anywhere else in the repo (no CI, no README, no other doc) before deleting. Use `deploy-cloudrun.sh` or `terraform/main.tf` for all deploys.
+11. ~~`mobile/app.json`'s Android `permissions` array requested `READ_SMS` and `RECEIVE_SMS`~~ — **Fixed 2026-07-12:** confirmed zero SMS-related code anywhere in `mobile/` (`mobile/services/gmail.ts` is an empty two-line stub, `// Gmail integration — coming in v1.1`, and nothing else references SMS), so removed both from the `permissions` array. `READ_SMS`/`RECEIVE_SMS` are Google Play restricted permissions requiring a declaration form and justification in Play Console; they were an unnecessary Play Store rejection risk and privacy footprint. `permissions` is now just `["CAMERA", "RECORD_AUDIO"]`, matching what's actually used.
+12. **The `WS_SHARED_SECRET` fixed in known issue #9 is served in plaintext to anyone who loads the public site — it does not actually gate access the way the name implies.** `server.js`'s `serveIndexWithSecret` (the handler for `GET /` and `/index.html`) injects the live `WS_SHARED_SECRET` value directly into the HTML sent to *any* visitor, no login or check required. View-source (or `curl` the URL) trivially recovers the secret. This means the auth gate only stops connections that never touch the frontend page at all (blind scripted hits directly against `/ws`, which was the literal threat described in #9) — it does **not** stop anyone who loads the public URL once, extracts the secret, and then scripts unlimited direct WS connections from unlimited IPs (the per-IP cap of 5 connections in `server.js` is easy to route around with multiple IPs/proxies, and there is no global concurrency cap at all). Practically this bounds cost only against *unaware* abuse, not *deliberate* abuse by anyone who visits the page — worth deciding whether that's an acceptable risk at current (personal-testing / hackathon-demo) scale, or whether the frontend needs a different distribution model (e.g. a short-lived per-session token minted by an authenticated endpoint instead of a static secret baked into public HTML). Not fixed — flagged for a decision, not a code change, since the "right" fix depends on how public-facing this is meant to stay.
 
 ## Session status — iPhone testing + App Store readiness plan (started 2026-07-11, resumed after a mid-session shutdown)
 
-Working through a 6-phase plan: (1) core mobile functionality, (2) security, (3) performance/reliability, (4) automated smoke checks, (5) iOS-specific readiness, (6) App Store readiness report. Phases 1–2 are done as of 2026-07-12; phases 3–6 have not been started.
+Working through a 6-phase plan: (1) core mobile functionality, (2) security, (3) performance/reliability, (4) automated smoke checks, (5) iOS-specific readiness, (6) App Store readiness report. Phases 1–5 are done as of 2026-07-12; phase 6 is a standalone report (see below, not stored in this file).
 
-**Phase 1 — Core functionality: confirmed done.** `mobile/app/(main)/home.tsx` genuinely captures camera frames and plays back audio (see known issue #4). No code changes needed this session, just re-verification.
+**Phase 1 — Core functionality: confirmed done.** `mobile/app/(main)/home.tsx` genuinely captures camera frames and plays back audio (see known issue #4).
 
-**Phase 2 — Security: done**, see known issues #8–9 above for what changed. Origin-header checks were considered and deliberately **not** added — the realistic threat here (scripted clients hitting the URL directly) doesn't send an `Origin` header at all, so the shared secret already covers it more effectively than an origin allow-list would.
+**Phase 2 — Security: done**, see known issues #8–9 above for what changed. Origin-header checks were considered and deliberately **not** added — the realistic threat here (scripted clients hitting the URL directly) doesn't send an `Origin` header at all, so the shared secret already covers it more effectively than an origin allow-list would. **Revisit:** known issue #12 (secret is readable in the public HTML) means this phase's protection is weaker against a deliberate/motivated actor than the original writeup implied — read it before treating WS auth as a hard boundary.
+
+**Phase 3 — Performance/reliability: done.**
+- `backend/agents.js`'s `timers` Map was module-level, shared across all connections (same bug class as the already-fixed `currentUserId` global) — fixed by scoping it per-`userId` via `getUserTimers(userId)`.
+- `server.js`'s Gemini `onerror` callback notified the client but never closed the socket or cleared `session`, unlike `onclose` — a Gemini-side error not followed by a close event left a zombie connection holding a per-IP connection slot indefinitely. Fixed: `onerror` now closes the client socket too, which routes through the existing `clientWs` `close` handler cleanup.
+- `memory.js` read/write volume per tool call: reviewed, no fix needed — each tool call does 0–2 sequential Firestore round trips (~50–150ms each), a minor voice-latency add but not a real bottleneck at personal-testing scale.
+- Worst-case Gemini cost: rate limits (5 conns/IP, 30 msg/sec/conn) bound cost *per IP*, but there's no global concurrency cap, and known issue #12 means the secret doesn't actually restrict *who* can open connections — so total worst-case cost is effectively unbounded if the public URL gets traffic. Rough per-connection order of magnitude at `gemini-2.5-flash-native-audio` pricing ($3/1M audio-input tokens, $12/1M audio-output tokens, $3/1M image tokens, ~25 tokens/sec of audio): well under $0.10/minute per open connection: continuous audio in+out plus a frame every ~2s.
+
+**Phase 4 — Automated smoke checks: done.** Added `backend/test/server.smoke.test.js` (Node's built-in `node:test`, no new dependency) — see Commands section above for what it covers and its deliberate scope limits. No lint/typecheck added: mobile's existing `npx tsc --noEmit` already covers typechecking there, and backend genuinely has nothing today; left as optional/low-priority since a lint config is a style decision, not a correctness gap.
+
+**Phase 5 — iOS-specific readiness: done, with one open item.**
+- `NSCameraUsageDescription`/`NSMicrophoneUsageDescription` already present in `mobile/app.json`.
+- known issue #11 (unused Android `READ_SMS`/`RECEIVE_SMS`) fixed.
+- Expo Go vs EAS build: **Expo Go works as-is** for dev iteration — every native dependency (`expo-camera`, `expo-av`, `expo-secure-store`, `react-native-reanimated`/`worklets`, `expo-router`, etc.) is within Expo Go SDK 54's bundled module set, no custom native module requiring a dev client. Caveat: Expo Go uses its *own* bundled permission strings/manifest, so the custom `NSCameraUsageDescription`/Android `permissions` in `app.json` only take effect in a real EAS build — camera/mic *function* identically in Expo Go, but you won't see Argus's actual permission prompt copy until testing an EAS build. `mobile/eas.json` already has a `development` profile (`developmentClient: true`, internal distribution) ready to use.
+  - Quick dev-loop, no Apple Developer account needed: `cd mobile && npx expo start`, scan the QR with the Expo Go app.
+  - Real dev-client build (needed to see final permission copy, and eventually to submit): `cd mobile && npx eas login && npx eas build --profile development --platform ios`, install on device, then `npx expo start --dev-client`.
+  - Production/App Store build: `npx eas build --profile production --platform ios && npx eas submit --platform ios`.
+
+**Phase 6 (App Store readiness report):** report-only, delivered directly to the user at the end of the 2026-07-12 session rather than stored here (it doesn't hold up as durable repo guidance — Apple Developer account status and App Store Connect listing state are facts about the user's Apple account, not the code).
 
 **Your action items (nobody else can do these):**
 1. Generate a shared secret: `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`
 2. Set `WS_SHARED_SECRET=<that value>` in your real `backend/.env` (local dev) and redeploy Cloud Run with it — `./deploy-cloudrun.sh <GEMINI_API_KEY> <WS_SHARED_SECRET>` (argument order changed, secret is now positional arg 2) or the Terraform equivalent with `-var="ws_shared_secret=..."`.
 3. Set the **same** value as `EXPO_PUBLIC_WS_SHARED_SECRET` in `mobile/.env`, plus `EXPO_PUBLIC_BACKEND_URL` (now required — the code no longer falls back to a hardcoded URL).
-4. When Phase 5 comes up: a physical iPhone and (for anything past Expo Go) an Apple Developer account for an EAS development build.
-5. Optional/low-priority: `mobile/.env.example` has what look like real Google OAuth client IDs rather than placeholders — not a secret (OAuth client IDs are meant to be public), just unusual for an example file. Your call whether to genericize it.
-
-**Claude's next action items, in phase order:**
-- **Phase 3 (performance/reliability):** `backend/agents.js`'s `timers` Map (used by the `cooking_timer` tool) is module-level, shared across **all** concurrent connections — not per-user, not per-connection. Same class of bug as the already-fixed `currentUserId` global (#2 above): one user's `cancel` clears every other user's timers too. Needs fixing. Also still to check: whether Gemini sessions/WS connections are fully cleaned up on error paths (not just the happy-path `close` handler), `memory.js` read/write volume per tool call (voice-latency impact), and a concrete worst-case Gemini cost estimate now that rate limiting bounds it.
-- **Phase 4 (automated checks):** no test suite exists. Add minimal smoke tests only — server starts and `/api/health` responds, a WS connection opens and receives `"connected"` (now needs the shared secret to succeed). Add lint/typecheck configs only if genuinely missing (mobile already has `tsc` via `npx tsc --noEmit`, confirmed working; backend has no lint config).
-- **Phase 5 (iOS-specific readiness):** check `mobile/app.json` for `NSCameraUsageDescription`/`NSMicrophoneUsageDescription`, determine whether Expo Go works as-is or an EAS development build is required (likely, given native modules beyond core Expo SDK), give exact commands.
-- **Phase 6 (App Store readiness report):** report-only, no code changes — Apple Developer account status, App Store Connect listing, privacy policy adequacy, App Review risk areas for always-listening camera/mic apps.
+4. Decide how to handle known issue #12 (secret readable in public HTML) — accept the risk at current scale, or ask for a redesign (e.g. per-session token minted server-side instead of a static secret baked into the page).
+5. A physical iPhone and an Apple Developer account, needed for the EAS development build step in Phase 5 above.
+6. Optional/low-priority: `mobile/.env.example` has what look like real Google OAuth client IDs rather than placeholders — not a secret (OAuth client IDs are meant to be public), just unusual for an example file. Your call whether to genericize it.
 
 ## Onboarding order for a fresh session
 

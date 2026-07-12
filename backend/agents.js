@@ -213,7 +213,16 @@ export const TOOLS = [
 // TOOL HANDLERS
 // ============================================================
 
-const timers = new Map();
+const timersByUser = new Map();
+
+function getUserTimers(userId) {
+  let userTimers = timersByUser.get(userId);
+  if (!userTimers) {
+    userTimers = new Map();
+    timersByUser.set(userId, userTimers);
+  }
+  return userTimers;
+}
 
 async function lookupRestaurantWebsite(name, loc) {
   const q=encodeURIComponent(loc?name+" restaurant "+loc:name+" restaurant official website");
@@ -259,6 +268,7 @@ export async function handleToolCall(functionCall, userId) {
     }
 
     case "cooking_timer": {
+      const timers = getUserTimers(userId);
       if (args.action === "set") {
         const id = Date.now().toString();
         const endTime = Date.now() + (args.duration_minutes || 5) * 60 * 1000;

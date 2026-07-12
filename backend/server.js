@@ -320,6 +320,10 @@ wss.on("connection", async (clientWs, req) => {
           console.error("Gemini error:", JSON.stringify(err).substring(0, 300));
           if (clientWs.readyState === WebSocket.OPEN) {
             clientWs.send(JSON.stringify({ type: "error", data: "Connection error" }));
+            // Gemini-side errors aren't reliably followed by onclose — close the
+            // client socket here too so the connection doesn't linger as a zombie
+            // (holding a per-IP connection slot, sending into a dead session).
+            clientWs.close();
           }
         },
 
