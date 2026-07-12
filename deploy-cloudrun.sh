@@ -5,11 +5,13 @@ PROJECT_ID="agus-488919"
 REGION="us-central1"
 SERVICE_NAME="argus"
 GEMINI_API_KEY="${1:-$GEMINI_API_KEY}"
-WEATHER_LAT="${2:-${WEATHER_LAT:-41.88}}"
-WEATHER_LON="${3:-${WEATHER_LON:--87.63}}"
-TIMEZONE="${4:-${TIMEZONE:-America/Chicago}}"
-if [ -z "$GEMINI_API_KEY" ]; then
-  echo "Usage: ./deploy-cloudrun.sh <GEMINI_API_KEY>"
+WS_SHARED_SECRET="${2:-$WS_SHARED_SECRET}"
+WEATHER_LAT="${3:-${WEATHER_LAT:-41.88}}"
+WEATHER_LON="${4:-${WEATHER_LON:--87.63}}"
+TIMEZONE="${5:-${TIMEZONE:-America/Chicago}}"
+if [ -z "$GEMINI_API_KEY" ] || [ -z "$WS_SHARED_SECRET" ]; then
+  echo "Usage: ./deploy-cloudrun.sh <GEMINI_API_KEY> <WS_SHARED_SECRET> [WEATHER_LAT] [WEATHER_LON] [TIMEZONE]"
+  echo "Generate a shared secret with: node -e \"console.log(require('crypto').randomBytes(32).toString('hex'))\""
   exit 1
 fi
 echo "Deploying Argus v0.3..."
@@ -33,7 +35,7 @@ gcloud run deploy $SERVICE_NAME \
   --source . \
   --region $REGION \
   --allow-unauthenticated \
-  --set-env-vars "GEMINI_API_KEY=$GEMINI_API_KEY,GCP_PROJECT_ID=$PROJECT_ID,WEATHER_LAT=$WEATHER_LAT,WEATHER_LON=$WEATHER_LON,TIMEZONE=$TIMEZONE" \
+  --set-env-vars "GEMINI_API_KEY=$GEMINI_API_KEY,WS_SHARED_SECRET=$WS_SHARED_SECRET,GCP_PROJECT_ID=$PROJECT_ID,WEATHER_LAT=$WEATHER_LAT,WEATHER_LON=$WEATHER_LON,TIMEZONE=$TIMEZONE" \
   --port 8080 \
   --memory 512Mi \
   --cpu 1 \

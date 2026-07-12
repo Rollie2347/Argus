@@ -28,6 +28,12 @@ variable "gemini_api_key" {
   sensitive   = true
 }
 
+variable "ws_shared_secret" {
+  description = "Shared secret gating the WebSocket endpoint. Generate with: node -e \"console.log(require('crypto').randomBytes(32).toString('hex'))\""
+  type        = string
+  sensitive   = true
+}
+
 variable "weather_lat" {
   description = "Latitude for weather (default: Chicago)"
   type        = string
@@ -93,6 +99,11 @@ resource "google_cloud_run_v2_service" "argus" {
       env {
         name  = "GEMINI_API_KEY"
         value = var.gemini_api_key
+      }
+
+      env {
+        name  = "WS_SHARED_SECRET"
+        value = var.ws_shared_secret
       }
 
       env {
