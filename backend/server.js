@@ -4,8 +4,10 @@
  */
 
 import { GoogleGenAI, Modality } from "@google/genai";
+import crypto from "crypto";
 import dotenv from "dotenv";
 import express from "express";
+import { readFileSync } from "fs";
 import { createServer } from "http";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -18,6 +20,7 @@ dotenv.config();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 8080;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const WS_SHARED_SECRET = process.env.WS_SHARED_SECRET;
 const MODEL = "gemini-2.5-flash-native-audio-preview-12-2025";
 
 // Validate required env vars at startup
@@ -25,10 +28,44 @@ if (!GEMINI_API_KEY) {
   console.error("FATAL: GEMINI_API_KEY is not set. Set it in your .env file or environment.");
   process.exit(1);
 }
+if (!WS_SHARED_SECRET) {
+  console.error("FATAL: WS_SHARED_SECRET is not set. Set it in your .env file or environment — see backend/.env.example.");
+  process.exit(1);
+}
+
+function getClientIp(req) {
+  return ((req.headers["x-forwarded-for"] || req.socket.remoteAddress) + "").split(",")[0].trim();
+}
+
+// Per-IP request counter for HTTP routes. In-memory only — on Cloud Run this
+// resets per instance and doesn't coordinate across concurrent instances, but
+// with session-affinity scale-to-zero traffic at personal-testing volume that's
+// an acceptable gap, not a real bypass surface.
+function httpRateLimit(windowMs, max) {
+  const hits = new Map();
+  setInterval(() => {
+    const now = Date.now();
+    for (const [ip, entry] of hits) if (now > entry.resetAt) hits.delete(ip);
+  }, windowMs).unref();
+  return (req, res, next) => {
+    const ip = getClientIp(req);
+    const now = Date.now();
+    let entry = hits.get(ip);
+    if (!entry || now > entry.resetAt) {
+      entry = { count: 0, resetAt: now + windowMs };
+      hits.set(ip, entry);
+    }
+    entry.count++;
+    if (entry.count > max) return res.status(429).json({ error: "Too many requests" });
+    next();
+  };
+}
 
 // Express app
 const app = express();
 const server = createServer(app);
+
+app.use("/api", httpRateLimit(60_000, 60));
 
 app.get("/api/health", (req, res) => {
   const tools = TOOLS[0].functionDeclarations.map(f => f.name);
@@ -71,38 +108,62 @@ app.delete("/api/user/:userId", async (req, res) => {
   }
 });
 
-// Serve frontend
+// Serve frontend. index.html gets the WS shared secret injected server-side
+// (from env, never committed) so the public demo page can open an authorized
+// connection without the secret ever living in git history.
 const frontendPath = path.join(__dirname, "..", "frontend");
-app.get("/", (req, res) => {
-  res.sendFile(path.join(frontendPath, "index.html"));
-});
+function serveIndexWithSecret(req, res) {
+  const html = readFileSync(path.join(frontendPath, "index.html"), "utf8")
+    .replace("__WS_SHARED_SECRET__", WS_SHARED_SECRET);
+  res.type("html").send(html);
+}
+app.get("/", serveIndexWithSecret);
+app.get("/index.html", serveIndexWithSecret);
 app.get("/privacy", (req, res) => {
   res.sendFile(path.join(frontendPath, "privacy.html"));
 });
-app.use(express.static(frontendPath));
+app.use(express.static(frontendPath, { index: false }));
 
-// WebSocket server
-const wss = new WebSocketServer({ server, path: "/ws" });
+// WebSocket server. maxPayload is a blunt outer guard against oversized frames
+// arriving before per-message validation below ever runs.
+const wss = new WebSocketServer({ server, path: "/ws", maxPayload: 4 * 1024 * 1024 });
+
+const WS_MAX_CONN_PER_IP = 5;
+const WS_MSG_RATE_LIMIT = 30; // messages/sec/connection
+const ALLOWED_WS_TYPES = new Set(["audio", "image", "user_id", "greet"]);
+const MAX_AUDIO_B64_LEN = 200_000; // ~150KB raw — generous for a 1s 16kHz/16-bit mono chunk
+const MAX_IMAGE_B64_LEN = 3_000_000; // ~2.2MB raw — generous for a quality:0.5 JPEG frame
+const connectionsByIp = new Map();
+
+function validSecret(secret) {
+  if (typeof secret !== "string" || !secret) return false;
+  const a = Buffer.from(secret);
+  const b = Buffer.from(WS_SHARED_SECRET);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
 
 // Both known clients (frontend/index.html, mobile/services/websocket.ts) send
-// {type:"user_id", id, name} as their first message right after the socket opens.
-// We need it before building per-user context, so wait for it (bounded by a
-// timeout) instead of racing ahead with a stale/default id.
-function waitForUserId(clientWs, timeoutMs = 3000) {
+// {type:"user_id", id, name, secret} as their first message right after the
+// socket opens. Reject immediately on a missing/wrong secret instead of
+// falling back to a default identity — an unauthenticated connection should
+// never reach the point of opening a billed Gemini session.
+function waitForAuth(clientWs, timeoutMs = 3000) {
   return new Promise((resolve) => {
     let done = false;
-    const finish = (id) => {
+    const finish = (result) => {
       if (done) return;
       done = true;
       clearTimeout(timer);
       clientWs.off("message", onMessage);
-      resolve(id);
+      resolve(result);
     };
-    const timer = setTimeout(() => finish("default"), timeoutMs);
+    const timer = setTimeout(() => finish(null), timeoutMs);
     function onMessage(raw) {
       try {
         const msg = JSON.parse(raw.toString());
-        if (msg.type === "user_id" && msg.id) finish(msg.id);
+        if (msg.type !== "user_id" || !msg.id) return;
+        if (!validSecret(msg.secret)) return finish(null);
+        finish({ id: String(msg.id).slice(0, 200), name: msg.name ? String(msg.name).slice(0, 200) : "" });
       } catch (_) {}
     }
     clientWs.on("message", onMessage);
@@ -110,14 +171,44 @@ function waitForUserId(clientWs, timeoutMs = 3000) {
 }
 
 wss.on("connection", async (clientWs, req) => {
-  console.log("👁️ Client connected");
+  const ip = getClientIp(req);
+  console.log("👁️ Client connected", ip);
 
-  // Start listening for the client's user_id immediately, before any other
-  // awaits below, so the message isn't missed.
-  const userIdPromise = waitForUserId(clientWs);
+  const currentConns = connectionsByIp.get(ip) || 0;
+  if (currentConns >= WS_MAX_CONN_PER_IP) {
+    console.warn("Rejected connection — too many from", ip);
+    clientWs.close(4008, "too many connections");
+    return;
+  }
+  connectionsByIp.set(ip, currentConns + 1);
+  let releasedConn = false;
+  const releaseConn = () => {
+    if (releasedConn) return;
+    releasedConn = true;
+    const c = (connectionsByIp.get(ip) || 1) - 1;
+    if (c <= 0) connectionsByIp.delete(ip); else connectionsByIp.set(ip, c);
+  };
+  clientWs.on("close", releaseConn);
+  clientWs.on("error", releaseConn);
 
-  // Auto-detect user location via IP for personalised weather + context
-  const ip = ((req.headers["x-forwarded-for"] || req.socket.remoteAddress) + "").split(",")[0].trim();
+  let msgCount = 0;
+  let msgWindowStart = Date.now();
+  function withinMsgRate() {
+    const now = Date.now();
+    if (now - msgWindowStart > 1000) { msgWindowStart = now; msgCount = 0; }
+    msgCount++;
+    return msgCount <= WS_MSG_RATE_LIMIT;
+  }
+
+  const auth = await waitForAuth(clientWs);
+  if (!auth) {
+    console.warn("Rejected unauthenticated WS connection from", ip);
+    clientWs.close(4001, "unauthorized");
+    return;
+  }
+
+  // Auto-detect user location via IP for personalised weather + context.
+  // Runs only after auth succeeds, so a rejected connection never triggers it.
   let userLat = parseFloat(process.env.WEATHER_LAT) || 41.88;
   let userLon = parseFloat(process.env.WEATHER_LON) || -87.63;
   let userCity = process.env.WEATHER_CITY || "your area";
@@ -128,7 +219,7 @@ wss.on("connection", async (clientWs, req) => {
     } catch (e) { console.warn("Geolocation failed:", e.message); }
   }
 
-  let userId = await userIdPromise;
+  let userId = auth.id;
   console.log("👤 User:", userId);
 
   const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
@@ -245,10 +336,13 @@ wss.on("connection", async (clientWs, req) => {
 
     // Client → Gemini
     clientWs.on("message", (raw) => {
+      if (!withinMsgRate()) return; // silently drop — protects Gemini quota from a flooding client
       try {
         const msg = JSON.parse(raw.toString());
+        if (!msg || typeof msg.type !== "string" || !ALLOWED_WS_TYPES.has(msg.type)) return;
 
         if (msg.type === "audio" && session) {
+          if (typeof msg.data !== "string" || !msg.data || msg.data.length > MAX_AUDIO_B64_LEN) return;
           audioChunks++;
           if (audioChunks % 100 === 1) {
             console.log(`🎤 Audio chunks: ${audioChunks}`);
@@ -260,6 +354,7 @@ wss.on("connection", async (clientWs, req) => {
             },
           });
         } else if (msg.type === "user_id" && msg.id) {
+          if (typeof msg.id !== "string" || msg.id.length > 200) return;
           userId = msg.id;
           console.log("👤 User:", msg.id);
         } else if (msg.type === "greet" && session) {
@@ -267,6 +362,7 @@ wss.on("connection", async (clientWs, req) => {
             session.sendClientContent({ turns: [{ role: "user", parts: [{ text: "greet" }] }], turnComplete: true });
           } catch (e) { console.warn("Greet failed:", e.message); }
         } else if (msg.type === "image" && session) {
+          if (typeof msg.data !== "string" || !msg.data || msg.data.length > MAX_IMAGE_B64_LEN) return;
           imageFrames++;
           console.log(`📷 Frame #${imageFrames}`);
           session.sendRealtimeInput({

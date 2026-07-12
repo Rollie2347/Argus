@@ -541,6 +541,7 @@
 
     <script>
         const BACKEND_WS = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
+        const WS_SECRET = "__WS_SHARED_SECRET__"; // injected server-side from process.env.WS_SHARED_SECRET, never committed
 
         let ws = null;
         let mediaStream = null;
@@ -665,7 +666,7 @@
                 // Per-user memory ID
                 let uid=localStorage.getItem("argus_uid")||null;
                 if(!uid){uid="u_"+Math.random().toString(36).substr(2,9);localStorage.setItem("argus_uid",uid);}
-                ws.send(JSON.stringify({type:"user_id",id:uid}));
+                ws.send(JSON.stringify({type:"user_id",id:uid,secret:WS_SECRET}));
                 startAudioCapture();
                 startVideoCapture();
                 // Proactive greeting
