@@ -328,7 +328,11 @@ export async function handleToolCall(functionCall, userId) {
       else if (args.category === "allergy") update.allergies = args.value;
       else if (args.category === "personal" && args.key === "name") update.name = args.value;
       else {
-        update[`preferences.${args.key}`] = args.value;
+        // set() with {merge:true} treats a top-level key literally, it does not
+        // split "preferences.foo" into a nested path the way update() does — so
+        // merge the existing map in JS and write it back as a real nested object.
+        const current = await getUserMemory(userId);
+        update.preferences = { ...(current.preferences || {}), [args.key]: args.value };
       }
       await updateUserMemory(userId, update);
       return { stored: true, category: args.category, key: args.key, value: args.value };

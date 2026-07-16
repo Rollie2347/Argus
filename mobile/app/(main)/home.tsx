@@ -22,11 +22,14 @@ async function getAudioB64(uri: string): Promise<string> {
   return btoa(bin);
 }
 
-// Gemini sends raw PCM16 mono @ 24kHz; expo-av can only load audio files/URIs,
-// so wrap each chunk in a minimal WAV header before handing it to Audio.Sound.
-function pcmToWavBase64(pcmB64: string, sampleRate: number): string {
-  const pcmBin = atob(pcmB64);
-  const pcmLen = pcmBin.length;
+// Gemini sends raw PCM16 mono @ 24kHz in many small chunks; expo-av can only
+// load audio files/URIs, not append to an already-playing one, so each
+// playable unit needs its own WAV header. Chunks are merged (see
+// pcmChunksToWavBase64) before wrapping instead of wrapping one at a time, to
+// avoid a Sound-object load/gap at every chunk boundary.
+function pcmChunksToWavBase64(pcmB64Chunks: string[], sampleRate: number): string {
+  const pcmBins = pcmB64Chunks.map(atob);
+  const pcmLen = pcmBins.reduce((sum, bin) => sum + bin.length, 0);
   const headerLen = 44;
   const buf = new ArrayBuffer(headerLen + pcmLen);
   const view = new DataView(buf);
@@ -47,7 +50,11 @@ function pcmToWavBase64(pcmB64: string, sampleRate: number): string {
   view.setUint32(40, pcmLen, true);
 
   const bytes = new Uint8Array(buf);
-  for (let i = 0; i < pcmLen; i++) bytes[headerLen + i] = pcmBin.charCodeAt(i);
+  let offset = headerLen;
+  for (const bin of pcmBins) {
+    for (let i = 0; i < bin.length; i++) bytes[offset + i] = bin.charCodeAt(i);
+    offset += bin.length;
+  }
   let bin = "";
   bytes.forEach(b => bin += String.fromCharCode(b));
   return btoa(bin);
@@ -128,11 +135,17 @@ export default function Home() {
 
   async function playNextInQueue() {
     if (isPlayingRef.current) return;
-    const next = audioQueueRef.current.shift();
-    if (!next) return;
+    if (audioQueueRef.current.length === 0) return;
+    // Drain everything that's arrived since the last chunk started playing and
+    // merge it into one WAV. Gemini streams audio in many small pieces; playing
+    // each one as its own Audio.Sound means a load/gap at every chunk boundary,
+    // which is what causes audible jitter/breakup — merging cuts the number of
+    // those boundaries down to roughly one per playback burst.
+    const chunks = audioQueueRef.current;
+    audioQueueRef.current = [];
     isPlayingRef.current = true;
     try {
-      const wavB64 = pcmToWavBase64(next, 24000);
+      const wavB64 = pcmChunksToWavBase64(chunks, 24000);
       const { sound } = await Audio.Sound.createAsync({ uri: `data:audio/wav;base64,${wavB64}` }, { shouldPlay: true });
       soundRef.current = sound;
       sound.setOnPlaybackStatusUpdate((st) => {
@@ -202,19 +215,25 @@ export default function Home() {
           </TouchableOpacity>
         </View>
       </View>
-      {connected && camPerm?.granted ? (
-        <CameraView ref={cameraRef} style={s.camera} facing="back" />
-      ) : (
-        <View style={s.camPlaceholder}><Text style={s.eyeIcon}>◉</Text><Text style={s.dormantTxt}>Tap to awaken Argus</Text></View>
-      )}
-      <View style={s.badge}><Text style={[s.badgeTxt, status==="speaking" && {color:"#4a6fa5"}]}>{statusLabel[status]}</Text></View>
-      <ScrollView ref={scrollRef} style={s.transcript} contentContainerStyle={{padding:16}}>
-        {lines.map((l,i) => (
-          <Text key={i} style={[s.line, l.role==="argus" && s.lineArgus, l.role==="tool" && s.lineTool]}>
-            {l.role==="argus" ? "◉ " : l.role==="tool" ? "⚙ " : ""}{l.text}
-          </Text>
-        ))}
-      </ScrollView>
+      <View style={s.cameraWrap}>
+        {connected && camPerm?.granted ? (
+          <CameraView ref={cameraRef} style={StyleSheet.absoluteFill} facing="back" />
+        ) : (
+          <View style={[StyleSheet.absoluteFill, s.camPlaceholder]}><Text style={s.eyeIcon}>◉</Text><Text style={s.dormantTxt}>Tap to awaken Argus</Text></View>
+        )}
+        <View style={s.badgeFloating}><Text style={[s.badgeTxt, status==="speaking" && {color:"#4a6fa5"}]}>{statusLabel[status]}</Text></View>
+        {lines.length > 0 && (
+          <View style={s.transcriptOverlay}>
+            <ScrollView ref={scrollRef} contentContainerStyle={{padding:16}}>
+              {lines.map((l,i) => (
+                <Text key={i} style={[s.line, l.role==="argus" && s.lineArgus, l.role==="tool" && s.lineTool]}>
+                  {l.role==="argus" ? "◉ " : l.role==="tool" ? "⚙ " : ""}{l.text}
+                </Text>
+              ))}
+            </ScrollView>
+          </View>
+        )}
+      </View>
       <View style={s.controls}>
         <TouchableOpacity style={[s.connectBtn, connected && s.connectBtnActive]} onPress={connected ? disconnect : connect}>
           <Text style={s.connectBtnTxt}>{connected ? "✕" : "◉"}</Text>
@@ -232,13 +251,13 @@ const s = StyleSheet.create({
   headerActions:{flexDirection:"row",alignItems:"center",gap:14},
   deleteData:{color:"#c44a3f",fontSize:11},
   signOut:{color:"#9e978a",fontSize:12},
-  camera:{flex:1,maxHeight:260},
-  camPlaceholder:{height:260,alignItems:"center",justifyContent:"center",backgroundColor:"#111118"},
+  cameraWrap:{flex:1,backgroundColor:"#111118"},
+  camPlaceholder:{alignItems:"center",justifyContent:"center",backgroundColor:"#111118"},
   eyeIcon:{fontSize:80,color:"#c9a84c",opacity:0.3},
   dormantTxt:{color:"#9e978a",marginTop:12,fontSize:13},
-  badge:{alignItems:"center",paddingVertical:6},
+  badgeFloating:{position:"absolute",top:14,alignSelf:"center",backgroundColor:"rgba(8,8,12,0.6)",paddingHorizontal:14,paddingVertical:6,borderRadius:14},
   badgeTxt:{color:"#c9a84c",fontSize:11,letterSpacing:3,textTransform:"uppercase"},
-  transcript:{flex:1,backgroundColor:"#08080c"},
+  transcriptOverlay:{position:"absolute",left:0,right:0,bottom:0,maxHeight:"45%",backgroundColor:"rgba(8,8,12,0.78)"},
   line:{fontSize:14,color:"#9e978a",marginBottom:6,lineHeight:22},
   lineArgus:{color:"#c9a84c"},
   lineTool:{fontSize:11,color:"#8a6f2f"},

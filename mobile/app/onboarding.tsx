@@ -7,9 +7,9 @@ const { width } = Dimensions.get("window");
 
 const SLIDES = [
   { icon:"◉", title:"Meet Argus", body:"Your AI companion that sees, hears, and remembers. Tap the eye to connect — then just start talking." },
-  { icon:"📷", title:"Point & Ask", body:"Point your camera at anything — food, a broken appliance, a label — and ask Argus about it in real time." },
-  { icon:"🧠", title:"It Remembers You", body:"Tell Argus your allergies, goals, or preferences once. It will remember them every session, forever." },
-  { icon:"🗣️", title:"Just Talk", body:"No typing. No menus. Say what you need — Argus handles the rest. Tap the mic to mute if needed." },
+  { icon:"◉", title:"Point & Ask", body:"Point your camera at anything — food, a broken appliance, a label — and ask Argus about it in real time." },
+  { icon:"◉", title:"It Remembers You", body:"Tell Argus your allergies, goals, or preferences once. It will remember them every session, forever." },
+  { icon:"◉", title:"Just Talk", body:"No typing. No menus. Say what you need — Argus handles the rest. Tap the mic to mute if needed." },
 ];
 
 export default function Onboarding() {
