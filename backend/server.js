@@ -122,6 +122,12 @@ app.get("/index.html", serveIndexWithSecret);
 app.get("/privacy", (req, res) => {
   res.sendFile(path.join(frontendPath, "privacy.html"));
 });
+app.get("/terms", (req, res) => {
+  res.sendFile(path.join(frontendPath, "terms.html"));
+});
+app.get("/about", (req, res) => {
+  res.sendFile(path.join(frontendPath, "about.html"));
+});
 app.use(express.static(frontendPath, { index: false }));
 
 // WebSocket server. maxPayload is a blunt outer guard against oversized frames
