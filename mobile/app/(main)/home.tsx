@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { View, Text, TouchableOpacity, StyleSheet, ScrollView, SafeAreaView, Alert } from "react-native";
+import { View, Text, TouchableOpacity, StyleSheet, ScrollView, SafeAreaView, Alert, Switch, Animated } from "react-native";
 import { CameraView, useCameraPermissions } from "expo-camera";
 import { Audio } from "expo-av";
 import { router } from "expo-router";
@@ -12,6 +12,24 @@ type Line = { text: string; role: "argus"|"user"|"tool" };
 
 const CHUNK_MS = 1000;
 const FRAME_MS = 2000;
+const AUDIO_GAIN = 1.6;
+
+const TOOL_LABELS: Record<string, string> = {
+  identify_scene: "Looking at what's around you",
+  get_recipe_suggestion: "Finding a recipe",
+  cooking_timer: "Setting a timer",
+  compare_products: "Comparing products",
+  diagnose_problem: "Diagnosing the problem",
+  read_text: "Reading the text",
+  manage_shopping_list: "Updating your shopping list",
+  remember_preference: "Remembering that",
+  recall_memory: "Checking what it remembers",
+  get_weather: "Checking the weather",
+  log_daily_activity: "Logging that",
+  get_daily_summary: "Pulling up your day",
+  web_search: "Searching the web",
+  get_restaurant_website: "Finding the restaurant's website",
+};
 
 async function getAudioB64(uri: string): Promise<string> {
   const r = await fetch(uri);
@@ -55,9 +73,34 @@ function pcmChunksToWavBase64(pcmB64Chunks: string[], sampleRate: number): strin
     for (let i = 0; i < bin.length; i++) bytes[offset + i] = bin.charCodeAt(i);
     offset += bin.length;
   }
+  // Gemini's output level plus iOS's playAndRecord routing (see home.tsx's
+  // volume note) both leave played-back audio quieter than expected — apply a
+  // digital gain with clamping so int16 samples don't wrap on overflow.
+  for (let i = headerLen; i < buf.byteLength - 1; i += 2) {
+    const sample = view.getInt16(i, true);
+    const boosted = Math.max(-32768, Math.min(32767, Math.round(sample * AUDIO_GAIN)));
+    view.setInt16(i, boosted, true);
+  }
+
   let bin = "";
   bytes.forEach(b => bin += String.fromCharCode(b));
   return btoa(bin);
+}
+
+function ErrorToast({ text, onDone }: { text: string; onDone: () => void }) {
+  const opacity = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    Animated.timing(opacity, { toValue: 1, duration: 200, useNativeDriver: true }).start();
+    const t = setTimeout(() => {
+      Animated.timing(opacity, { toValue: 0, duration: 600, useNativeDriver: true }).start(({ finished }) => { if (finished) onDone(); });
+    }, 3800);
+    return () => clearTimeout(t);
+  }, []);
+  return (
+    <Animated.View style={[s.errorToast, { opacity }]}>
+      <Text style={s.errorToastTxt}>{text}</Text>
+    </Animated.View>
+  );
 }
 
 export default function Home() {
@@ -65,6 +108,8 @@ export default function Home() {
   const [status, setStatus] = useState<Status>("dormant");
   const [lines, setLines] = useState<Line[]>([]);
   const [muted, setMuted] = useState(false);
+  const [thinkingHint, setThinkingHint] = useState<string|null>(null);
+  const [errors, setErrors] = useState<{id:number; text:string}[]>([]);
   const [camPerm, requestCam] = useCameraPermissions();
   const socketRef = useRef<ArgusSocket|null>(null);
   const scrollRef = useRef<ScrollView>(null);
@@ -72,6 +117,7 @@ export default function Home() {
   const loopRef = useRef<boolean>(false);
   const cameraRef = useRef<CameraView>(null);
   const frameIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const lastActivityRef = useRef<number>(Date.now());
   const audioQueueRef = useRef<string[]>([]);
   const isPlayingRef = useRef(false);
   const soundRef = useRef<Audio.Sound | null>(null);
@@ -82,13 +128,23 @@ export default function Home() {
   }
 
   function handleMsg(msg: any) {
+    lastActivityRef.current = Date.now();
     if (msg.type === "connected") setStatus("observing");
     else if (msg.type === "text") { addLine(msg.data, "argus"); setStatus("observing"); }
-    else if (msg.type === "tool_event") addLine(msg.tool, "tool");
+    else if (msg.type === "tool_event") addLine(TOOL_LABELS[msg.tool] || msg.tool, "tool");
     else if (msg.type === "audio") { setStatus("speaking"); enqueueAudio(msg.data); }
     else if (msg.type === "turn_complete") setStatus("observing");
     else if (msg.type === "disconnected") { setStatus("dormant"); socketRef.current = null; stopAudio(); stopFrameLoop(); stopPlayback(); }
-    else if (msg.type === "error") { addLine(msg.data, "argus"); setStatus("error"); }
+    else if (msg.type === "error") { pushError(msg.data); setStatus("error"); }
+  }
+
+  function pushError(text: string) {
+    const id = Date.now() + Math.random();
+    setErrors(prev => [...prev.slice(-2), { id, text }]);
+  }
+
+  function toggleMute(micOn: boolean) {
+    setMuted(!micOn);
   }
 
   async function startAudioLoop() {
@@ -169,6 +225,17 @@ export default function Home() {
 
   useEffect(() => { getStoredUser().then(u => { if (!u) router.replace("/sign-in"); else setUser(u); }); Audio.requestPermissionsAsync(); }, []);
 
+  useEffect(() => {
+    if (status !== "observing") { setThinkingHint(null); return; }
+    const iv = setInterval(() => {
+      const elapsed = Date.now() - lastActivityRef.current;
+      if (elapsed > 8000) setThinkingHint("Taking a bit longer than usual, still here...");
+      else if (elapsed > 3500) setThinkingHint("Still thinking...");
+      else setThinkingHint(null);
+    }, 1000);
+    return () => clearInterval(iv);
+  }, [status]);
+
   async function connect() {
     if (!user) return;
     if (!camPerm?.granted) await requestCam();
@@ -221,13 +288,18 @@ export default function Home() {
         ) : (
           <View style={[StyleSheet.absoluteFill, s.camPlaceholder]}><Text style={s.eyeIcon}>◉</Text><Text style={s.dormantTxt}>Tap to awaken Argus</Text></View>
         )}
-        <View style={s.badgeFloating}><Text style={[s.badgeTxt, status==="speaking" && {color:"#4a6fa5"}]}>{statusLabel[status]}</Text></View>
+        <View style={s.badgeFloating}><Text style={[s.badgeTxt, status==="speaking" && {color:"#4a6fa5"}]}>{thinkingHint || statusLabel[status]}</Text></View>
+        {errors.length > 0 && (
+          <View style={s.errorStack} pointerEvents="none">
+            {errors.map(e => <ErrorToast key={e.id} text={e.text} onDone={() => setErrors(prev => prev.filter(x => x.id !== e.id))} />)}
+          </View>
+        )}
         {lines.length > 0 && (
           <View style={s.transcriptOverlay}>
             <ScrollView ref={scrollRef} contentContainerStyle={{padding:16}}>
               {lines.map((l,i) => (
                 <Text key={i} style={[s.line, l.role==="argus" && s.lineArgus, l.role==="tool" && s.lineTool]}>
-                  {l.role==="argus" ? "◉ " : l.role==="tool" ? "⚙ " : ""}{l.text}
+                  {l.role==="argus" ? "◉ " : ""}{l.text}
                 </Text>
               ))}
             </ScrollView>
@@ -238,7 +310,18 @@ export default function Home() {
         <TouchableOpacity style={[s.connectBtn, connected && s.connectBtnActive]} onPress={connected ? disconnect : connect}>
           <Text style={s.connectBtnTxt}>{connected ? "✕" : "◉"}</Text>
         </TouchableOpacity>
-        {connected ? <TouchableOpacity style={s.muteBtn} onPress={() => setMuted(!muted)}><Text style={s.muteTxt}>{muted ? "🔇" : "🎙️"}</Text></TouchableOpacity> : null}
+        {connected ? (
+          <View style={s.muteWrap}>
+            <Switch
+              value={!muted}
+              onValueChange={toggleMute}
+              trackColor={{ false: "#3a3a44", true: "#c9a84c" }}
+              thumbColor="#e8e0d0"
+              ios_backgroundColor="#3a3a44"
+            />
+            <Text style={s.muteLabel}>Mic</Text>
+          </View>
+        ) : null}
       </View>
     </SafeAreaView>
   );
@@ -257,6 +340,9 @@ const s = StyleSheet.create({
   dormantTxt:{color:"#9e978a",marginTop:12,fontSize:13},
   badgeFloating:{position:"absolute",top:14,alignSelf:"center",backgroundColor:"rgba(8,8,12,0.6)",paddingHorizontal:14,paddingVertical:6,borderRadius:14},
   badgeTxt:{color:"#c9a84c",fontSize:11,letterSpacing:3,textTransform:"uppercase"},
+  errorStack:{position:"absolute",top:56,left:16,right:16,alignItems:"center",gap:8},
+  errorToast:{backgroundColor:"rgba(196,74,63,0.92)",paddingHorizontal:16,paddingVertical:10,borderRadius:12,maxWidth:"100%"},
+  errorToastTxt:{color:"#fff",fontSize:13,textAlign:"center"},
   transcriptOverlay:{position:"absolute",left:0,right:0,bottom:0,maxHeight:"45%",backgroundColor:"rgba(8,8,12,0.78)"},
   line:{fontSize:14,color:"#9e978a",marginBottom:6,lineHeight:22},
   lineArgus:{color:"#c9a84c"},
@@ -265,6 +351,6 @@ const s = StyleSheet.create({
   connectBtn:{width:64,height:64,borderRadius:32,borderWidth:2,borderColor:"#c9a84c",alignItems:"center",justifyContent:"center"},
   connectBtnActive:{backgroundColor:"#1a1408"},
   connectBtnTxt:{color:"#c9a84c",fontSize:24},
-  muteBtn:{width:48,height:48,borderRadius:24,backgroundColor:"#1a1a24",alignItems:"center",justifyContent:"center"},
-  muteTxt:{fontSize:20},
+  muteWrap:{alignItems:"center",justifyContent:"center"},
+  muteLabel:{color:"#9e978a",fontSize:10,marginTop:4,letterSpacing:1,textTransform:"uppercase"},
 });
