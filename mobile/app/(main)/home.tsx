@@ -1,10 +1,11 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef } from "react";
 import { View, Text, TouchableOpacity, StyleSheet, ScrollView, SafeAreaView, Alert, Switch, Animated } from "react-native";
 import { CameraView, useCameraPermissions } from "expo-camera";
 import { Audio } from "expo-av";
 import { router } from "expo-router";
 import { getStoredUser, signOut, deleteAccount } from "../../services/auth";
 import { ArgusSocket } from "../../services/websocket";
+import { getCaptionsEnabled, subscribeCaptionsEnabled } from "../../services/settings";
 import type { User } from "../../services/auth";
 
 type Status = "dormant"|"connecting"|"observing"|"speaking"|"error";
@@ -110,6 +111,9 @@ export default function Home() {
   const [muted, setMuted] = useState(false);
   const [thinkingHint, setThinkingHint] = useState<string|null>(null);
   const [errors, setErrors] = useState<{id:number; text:string}[]>([]);
+  const [facing, setFacing] = useState<"front"|"back">("back");
+  const [captionsEnabled, setCaptionsEnabled] = useState(true);
+  const [toolStatus, setToolStatus] = useState<string|null>(null);
   const [camPerm, requestCam] = useCameraPermissions();
   const socketRef = useRef<ArgusSocket|null>(null);
   const scrollRef = useRef<ScrollView>(null);
@@ -121,6 +125,7 @@ export default function Home() {
   const audioQueueRef = useRef<string[]>([]);
   const isPlayingRef = useRef(false);
   const soundRef = useRef<Audio.Sound | null>(null);
+  const toolStatusTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   function addLine(text: string, role: Line["role"]) {
     setLines(prev => [...prev.slice(-20), { text, role }]);
@@ -130,12 +135,26 @@ export default function Home() {
   function handleMsg(msg: any) {
     lastActivityRef.current = Date.now();
     if (msg.type === "connected") setStatus("observing");
-    else if (msg.type === "text") { addLine(msg.data, "argus"); setStatus("observing"); }
-    else if (msg.type === "tool_event") addLine(TOOL_LABELS[msg.tool] || msg.tool, "tool");
+    else if (msg.type === "text") { addLine(msg.data, "argus"); setStatus("observing"); clearToolStatus(); }
+    else if (msg.type === "tool_event") showToolStatus(TOOL_LABELS[msg.tool] || msg.tool);
     else if (msg.type === "audio") { setStatus("speaking"); enqueueAudio(msg.data); }
-    else if (msg.type === "turn_complete") setStatus("observing");
-    else if (msg.type === "disconnected") { setStatus("dormant"); socketRef.current = null; stopAudio(); stopFrameLoop(); stopPlayback(); }
+    else if (msg.type === "turn_complete") { setStatus("observing"); clearToolStatus(); }
+    else if (msg.type === "disconnected") { setStatus("dormant"); socketRef.current = null; stopAudio(); stopFrameLoop(); stopPlayback(); clearToolStatus(); }
     else if (msg.type === "error") { pushError(msg.data); setStatus("error"); }
+  }
+
+  // Tool status (e.g. "Looking at what's around you") is shown as a transient
+  // hint rather than a permanent transcript line, so old activity descriptions
+  // don't linger in the caption box alongside newer dialogue.
+  function showToolStatus(label: string) {
+    setToolStatus(label);
+    if (toolStatusTimeoutRef.current) clearTimeout(toolStatusTimeoutRef.current);
+    toolStatusTimeoutRef.current = setTimeout(() => setToolStatus(null), 4000);
+  }
+
+  function clearToolStatus() {
+    if (toolStatusTimeoutRef.current) { clearTimeout(toolStatusTimeoutRef.current); toolStatusTimeoutRef.current = null; }
+    setToolStatus(null);
   }
 
   function pushError(text: string) {
@@ -226,6 +245,11 @@ export default function Home() {
   useEffect(() => { getStoredUser().then(u => { if (!u) router.replace("/sign-in"); else setUser(u); }); Audio.requestPermissionsAsync(); }, []);
 
   useEffect(() => {
+    getCaptionsEnabled().then(setCaptionsEnabled);
+    return subscribeCaptionsEnabled(setCaptionsEnabled);
+  }, []);
+
+  useEffect(() => {
     if (status !== "observing") { setThinkingHint(null); return; }
     const iv = setInterval(() => {
       const elapsed = Date.now() - lastActivityRef.current;
@@ -247,6 +271,8 @@ export default function Home() {
   }
 
   function disconnect() { stopAudio(); stopFrameLoop(); stopPlayback(); socketRef.current?.disconnect(); socketRef.current = null; setStatus("dormant"); }
+
+  function flipCamera() { setFacing(f => (f === "back" ? "front" : "back")); }
 
   function confirmDeleteData() {
     if (!user) return;
@@ -277,6 +303,9 @@ export default function Home() {
           <TouchableOpacity onPress={confirmDeleteData}>
             <Text style={s.deleteData}>Delete my data</Text>
           </TouchableOpacity>
+          <TouchableOpacity onPress={() => router.push("/(main)/settings")}>
+            <Text style={s.settingsIcon}>⚙</Text>
+          </TouchableOpacity>
           <TouchableOpacity onPress={async () => { disconnect(); await signOut(); router.replace("/sign-in"); }}>
             <Text style={s.signOut}>Sign out</Text>
           </TouchableOpacity>
@@ -284,7 +313,7 @@ export default function Home() {
       </View>
       <View style={s.cameraWrap}>
         {connected && camPerm?.granted ? (
-          <CameraView ref={cameraRef} style={StyleSheet.absoluteFill} facing="back" />
+          <CameraView ref={cameraRef} style={StyleSheet.absoluteFill} facing={facing} />
         ) : (
           <View style={[StyleSheet.absoluteFill, s.camPlaceholder]}><Text style={s.eyeIcon}>◉</Text><Text style={s.dormantTxt}>Tap to awaken Argus</Text></View>
         )}
@@ -294,19 +323,25 @@ export default function Home() {
             {errors.map(e => <ErrorToast key={e.id} text={e.text} onDone={() => setErrors(prev => prev.filter(x => x.id !== e.id))} />)}
           </View>
         )}
-        {lines.length > 0 && (
+        {captionsEnabled && (lines.length > 0 || toolStatus) && (
           <View style={s.transcriptOverlay}>
             <ScrollView ref={scrollRef} contentContainerStyle={{padding:16}}>
               {lines.map((l,i) => (
-                <Text key={i} style={[s.line, l.role==="argus" && s.lineArgus, l.role==="tool" && s.lineTool]}>
+                <Text key={i} style={[s.line, l.role==="argus" && s.lineArgus]}>
                   {l.role==="argus" ? "◉ " : ""}{l.text}
                 </Text>
               ))}
+              {toolStatus && <Text style={s.lineTool}>{toolStatus}</Text>}
             </ScrollView>
           </View>
         )}
       </View>
       <View style={s.controls}>
+        {connected ? (
+          <TouchableOpacity style={s.flipBtn} onPress={flipCamera}>
+            <Text style={s.flipBtnTxt}>⟲</Text>
+          </TouchableOpacity>
+        ) : null}
         <TouchableOpacity style={[s.connectBtn, connected && s.connectBtnActive]} onPress={connected ? disconnect : connect}>
           <Text style={s.connectBtnTxt}>{connected ? "✕" : "◉"}</Text>
         </TouchableOpacity>
@@ -332,6 +367,7 @@ const s = StyleSheet.create({
   logo:{color:"#c9a84c",fontSize:18,fontWeight:"700",letterSpacing:4},
   greeting:{color:"#e8e0d0",fontSize:14},
   headerActions:{flexDirection:"row",alignItems:"center",gap:14},
+  settingsIcon:{color:"#9e978a",fontSize:16},
   deleteData:{color:"#c44a3f",fontSize:11},
   signOut:{color:"#9e978a",fontSize:12},
   cameraWrap:{flex:1,backgroundColor:"#111118"},
@@ -353,4 +389,6 @@ const s = StyleSheet.create({
   connectBtnTxt:{color:"#c9a84c",fontSize:24},
   muteWrap:{alignItems:"center",justifyContent:"center"},
   muteLabel:{color:"#9e978a",fontSize:10,marginTop:4,letterSpacing:1,textTransform:"uppercase"},
+  flipBtn:{width:48,height:48,borderRadius:24,borderWidth:2,borderColor:"#3a3a44",alignItems:"center",justifyContent:"center"},
+  flipBtnTxt:{color:"#9e978a",fontSize:20},
 });

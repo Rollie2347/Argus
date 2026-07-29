@@ -1,0 +1,18 @@
+diff --git a/node_modules/expo-av/ios/EXAV/EXAV.m b/node_modules/expo-av/ios/EXAV/EXAV.m
+index 7153d28..5e7da86 100644
+--- a/node_modules/expo-av/ios/EXAV/EXAV.m
++++ b/node_modules/expo-av/ios/EXAV/EXAV.m
+@@ -326,6 +326,13 @@ EX_EXPORT_MODULE(ExponentAV);
+   if (_allowsAudioRecording) {
+     // Bluetooth input is only available when recording is allowed
+     requiredAudioCategoryOptions = requiredAudioCategoryOptions | AVAudioSessionCategoryOptionAllowBluetooth;
++    // Without this, .playAndRecord defaults output to the earpiece receiver
++    // instead of the main speaker when no external accessory is connected —
++    // besides being quiet, receiver-routed playback isn't treated as a normal
++    // media route, so hardware volume buttons don't audibly affect it.
++    // DefaultToSpeaker only changes the default when no Bluetooth/wired
++    // accessory is active; those still take priority automatically.
++    requiredAudioCategoryOptions = requiredAudioCategoryOptions | AVAudioSessionCategoryOptionDefaultToSpeaker;
+   }
+   
+   return [_kernelAudioSessionManagerDelegate setCategory:requiredAudioCategory withOptions:requiredAudioCategoryOptions forModule:self];
