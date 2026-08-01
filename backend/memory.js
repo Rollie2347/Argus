@@ -168,7 +168,11 @@ export async function claimUserSecret(userId) {
   const ref = db.collection("users").doc(userId);
   return db.runTransaction(async (tx) => {
     const doc = await tx.get(ref);
-    if (doc.exists) return null; // pre-existing doc (legacy or claimed) — never claimable by a stranger
+    // Only refuse if a secret is already set — never claimable by a stranger
+    // once secured. A doc that exists but has no deviceSecret yet (e.g. an
+    // earlier claim attempt that failed silently, or a doc created by some
+    // other write before claim ever ran) is still safe to claim.
+    if (doc.exists && doc.data().deviceSecret) return null;
     const secret = crypto.randomBytes(32).toString("hex");
     tx.set(ref, { deviceSecret: secret }, { merge: true });
     return secret;

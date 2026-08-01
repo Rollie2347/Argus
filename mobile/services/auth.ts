@@ -7,21 +7,29 @@ export type User = { id: string; name: string; email: string };
 
 const SECRET_KEY = "argus_secret";
 
+// Claims (or re-claims) this device's secret so destructive calls (e.g.
+// delete) can be authorized instead of trusting the id alone. Safe to retry:
+// the backend only refuses once a secret is actually set for this id, so a
+// prior silently-failed attempt (network blip, cold backend) can always be
+// healed by trying again.
+async function claimSecret(id: string): Promise<string | null> {
+  try {
+    const r = await fetch(`${BACKEND}/api/user/${id}/claim`, { method: "POST" });
+    if (r.ok) {
+      const { secret } = await r.json();
+      if (secret) { await SecureStore.setItemAsync(SECRET_KEY, secret); return secret; }
+    }
+  } catch {}
+  return null;
+}
+
 export async function saveUser(name: string): Promise<User> {
   let id = await AsyncStorage.getItem("argus_uid");
   if (!id) {
     id = "u_" + Crypto.randomUUID();
     await AsyncStorage.setItem("argus_uid", id);
-    // Claim this fresh id's device secret so later destructive calls (e.g.
-    // delete) can be authorized instead of trusting the id alone.
-    try {
-      const r = await fetch(`${BACKEND}/api/user/${id}/claim`, { method: "POST" });
-      if (r.ok) {
-        const { secret } = await r.json();
-        if (secret) await SecureStore.setItemAsync(SECRET_KEY, secret);
-      }
-    } catch {}
   }
+  if (!(await SecureStore.getItemAsync(SECRET_KEY))) await claimSecret(id);
   const user: User = { id, name: name.trim(), email: "" };
   await AsyncStorage.setItem("argus_user", JSON.stringify(user));
   return user;
@@ -37,7 +45,8 @@ export async function signOut() {
 }
 
 export async function deleteAccount(userId: string): Promise<boolean> {
-  const secret = await SecureStore.getItemAsync(SECRET_KEY);
+  let secret = await SecureStore.getItemAsync(SECRET_KEY);
+  if (!secret) secret = await claimSecret(userId);
   try {
     const r = await fetch(`${BACKEND}/api/user/${userId}`, {
       method: "DELETE",
