@@ -1,17 +1,10 @@
-import { useEffect, useState } from "react";
-import { View, Text, TouchableOpacity, StyleSheet, SafeAreaView, Switch } from "react-native";
+import { View, Text, TouchableOpacity, StyleSheet, SafeAreaView, Switch, Linking } from "react-native";
 import { router } from "expo-router";
-import { getCaptionsEnabled, setCaptionsEnabled as saveCaptionsEnabled } from "../../services/settings";
+import { useCaptions } from "../../contexts/CaptionsContext";
+import { BACKEND } from "../../services/websocket";
 
 export default function Settings() {
-  const [captionsEnabled, setCaptions] = useState(true);
-
-  useEffect(() => { getCaptionsEnabled().then(setCaptions); }, []);
-
-  function toggleCaptions(value: boolean) {
-    setCaptions(value);
-    saveCaptionsEnabled(value);
-  }
+  const { captionsEnabled, setCaptionsEnabled } = useCaptions();
 
   return (
     <SafeAreaView style={s.safe}>
@@ -29,12 +22,19 @@ export default function Settings() {
         </View>
         <Switch
           value={captionsEnabled}
-          onValueChange={toggleCaptions}
+          onValueChange={setCaptionsEnabled}
           trackColor={{ false: "#3a3a44", true: "#c9a84c" }}
           thumbColor="#e8e0d0"
           ios_backgroundColor="#3a3a44"
         />
       </View>
+      <TouchableOpacity style={s.row} onPress={() => Linking.openURL(`${BACKEND}/privacy`)}>
+        <View style={{ flex: 1 }}>
+          <Text style={s.rowLabel}>Privacy Policy</Text>
+          <Text style={s.rowSub}>See what Argus collects, stores, and how to delete it</Text>
+        </View>
+        <Text style={s.rowChevron}>›</Text>
+      </TouchableOpacity>
     </SafeAreaView>
   );
 }
@@ -47,4 +47,5 @@ const s = StyleSheet.create({
   row: { flexDirection: "row", alignItems: "center", paddingHorizontal: 20, paddingVertical: 16, borderTopWidth: StyleSheet.hairlineWidth, borderColor: "#2a2a32", gap: 16 },
   rowLabel: { color: "#e8e0d0", fontSize: 15 },
   rowSub: { color: "#9e978a", fontSize: 12, marginTop: 4 },
+  rowChevron: { color: "#9e978a", fontSize: 20 },
 });

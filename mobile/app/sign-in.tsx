@@ -1,8 +1,9 @@
 import { useState } from "react";
-import { View, Text, TextInput, TouchableOpacity, StyleSheet, ActivityIndicator, KeyboardAvoidingView, Platform } from "react-native";
+import { View, Text, TextInput, TouchableOpacity, StyleSheet, ActivityIndicator, KeyboardAvoidingView, Platform, Linking } from "react-native";
 import { router } from "expo-router";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { saveUser } from "../services/auth";
+import { BACKEND } from "../services/websocket";
 
 export default function SignIn() {
   const [name, setName] = useState("");
@@ -32,6 +33,10 @@ export default function SignIn() {
       <TouchableOpacity style={[s.btn, !name.trim() && s.btnDisabled]} onPress={handleContinue} disabled={loading || !name.trim()}>
         {loading ? <ActivityIndicator color="#08080c" /> : <Text style={s.btnTxt}>Begin</Text>}
       </TouchableOpacity>
+      <Text style={s.legal}>
+        By continuing you agree to our{" "}
+        <Text style={s.legalLink} onPress={() => Linking.openURL(`${BACKEND}/privacy`)}>Privacy Policy</Text>
+      </Text>
     </KeyboardAvoidingView>
   );
 }
@@ -47,4 +52,6 @@ const s = StyleSheet.create({
   btn: { width:"100%", backgroundColor:"#c9a84c", paddingVertical:16, borderRadius:4, alignItems:"center", marginTop:8 },
   btnDisabled: { opacity:0.4 },
   btnTxt: { color:"#08080c", fontWeight:"600", fontSize:16 },
+  legal: { color:"#6a6a76", fontSize:12, marginTop:16, textAlign:"center" },
+  legalLink: { color:"#9e978a", textDecorationLine:"underline" },
 });

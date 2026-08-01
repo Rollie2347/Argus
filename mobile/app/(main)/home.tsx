@@ -5,7 +5,7 @@ import { Audio } from "expo-av";
 import { router } from "expo-router";
 import { getStoredUser, signOut, deleteAccount } from "../../services/auth";
 import { ArgusSocket } from "../../services/websocket";
-import { getCaptionsEnabled, subscribeCaptionsEnabled } from "../../services/settings";
+import { useCaptions } from "../../contexts/CaptionsContext";
 import type { User } from "../../services/auth";
 
 type Status = "dormant"|"connecting"|"observing"|"speaking"|"error";
@@ -14,6 +14,7 @@ type Line = { text: string; role: "argus"|"user"|"tool" };
 const CHUNK_MS = 1000;
 const FRAME_MS = 2000;
 const AUDIO_GAIN = 1.6;
+const CONNECT_TIMEOUT_MS = 12000;
 
 const TOOL_LABELS: Record<string, string> = {
   identify_scene: "Looking at what's around you",
@@ -112,7 +113,7 @@ export default function Home() {
   const [thinkingHint, setThinkingHint] = useState<string|null>(null);
   const [errors, setErrors] = useState<{id:number; text:string}[]>([]);
   const [facing, setFacing] = useState<"front"|"back">("back");
-  const [captionsEnabled, setCaptionsEnabled] = useState(true);
+  const { captionsEnabled } = useCaptions();
   const [toolStatus, setToolStatus] = useState<string|null>(null);
   const [camPerm, requestCam] = useCameraPermissions();
   const socketRef = useRef<ArgusSocket|null>(null);
@@ -126,21 +127,26 @@ export default function Home() {
   const isPlayingRef = useRef(false);
   const soundRef = useRef<Audio.Sound | null>(null);
   const toolStatusTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const connectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   function addLine(text: string, role: Line["role"]) {
     setLines(prev => [...prev.slice(-20), { text, role }]);
     setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 100);
   }
 
+  function clearConnectTimeout() {
+    if (connectTimeoutRef.current) { clearTimeout(connectTimeoutRef.current); connectTimeoutRef.current = null; }
+  }
+
   function handleMsg(msg: any) {
     lastActivityRef.current = Date.now();
-    if (msg.type === "connected") setStatus("observing");
+    if (msg.type === "connected") { clearConnectTimeout(); setStatus("observing"); }
     else if (msg.type === "text") { addLine(msg.data, "argus"); setStatus("observing"); clearToolStatus(); }
     else if (msg.type === "tool_event") showToolStatus(TOOL_LABELS[msg.tool] || msg.tool);
     else if (msg.type === "audio") { setStatus("speaking"); enqueueAudio(msg.data); }
     else if (msg.type === "turn_complete") { setStatus("observing"); clearToolStatus(); }
-    else if (msg.type === "disconnected") { setStatus("dormant"); socketRef.current = null; stopAudio(); stopFrameLoop(); stopPlayback(); clearToolStatus(); }
-    else if (msg.type === "error") { pushError(msg.data); setStatus("error"); }
+    else if (msg.type === "disconnected") { clearConnectTimeout(); setStatus("dormant"); socketRef.current = null; stopAudio(); stopFrameLoop(); stopPlayback(); clearToolStatus(); }
+    else if (msg.type === "error") { clearConnectTimeout(); pushError(msg.data); setStatus("error"); }
   }
 
   // Tool status (e.g. "Looking at what's around you") is shown as a transient
@@ -245,11 +251,6 @@ export default function Home() {
   useEffect(() => { getStoredUser().then(u => { if (!u) router.replace("/sign-in"); else setUser(u); }); Audio.requestPermissionsAsync(); }, []);
 
   useEffect(() => {
-    getCaptionsEnabled().then(setCaptionsEnabled);
-    return subscribeCaptionsEnabled(setCaptionsEnabled);
-  }, []);
-
-  useEffect(() => {
     if (status !== "observing") { setThinkingHint(null); return; }
     const iv = setInterval(() => {
       const elapsed = Date.now() - lastActivityRef.current;
@@ -268,9 +269,20 @@ export default function Home() {
     socketRef.current = sock;
     sock.connect();
     setTimeout(() => { startAudioLoop(); startFrameLoop(); }, 1500);
+    // Belt-and-suspenders: ArgusSocket's onerror/onclose usually fire on a bad
+    // connection, but a silently stalled OS-level socket attempt (bad network,
+    // blocked egress) could otherwise leave the UI on "Connecting" indefinitely.
+    clearConnectTimeout();
+    connectTimeoutRef.current = setTimeout(() => {
+      if (socketRef.current === sock) {
+        disconnect();
+        pushError("Couldn't reach Argus — check your connection and try again");
+        setStatus("error");
+      }
+    }, CONNECT_TIMEOUT_MS);
   }
 
-  function disconnect() { stopAudio(); stopFrameLoop(); stopPlayback(); socketRef.current?.disconnect(); socketRef.current = null; setStatus("dormant"); }
+  function disconnect() { clearConnectTimeout(); stopAudio(); stopFrameLoop(); stopPlayback(); socketRef.current?.disconnect(); socketRef.current = null; setStatus("dormant"); }
 
   function flipCamera() { setFacing(f => (f === "back" ? "front" : "back")); }
 
@@ -298,7 +310,6 @@ export default function Home() {
     <SafeAreaView style={s.safe}>
       <View style={s.header}>
         <Text style={s.logo}>◉ ARGUS</Text>
-        <Text style={s.greeting}>{user ? "Hi, " + user.name.split(" ")[0] : ""}</Text>
         <View style={s.headerActions}>
           <TouchableOpacity onPress={confirmDeleteData}>
             <Text style={s.deleteData}>Delete my data</Text>
@@ -365,7 +376,6 @@ const s = StyleSheet.create({
   safe:{flex:1,backgroundColor:"#08080c"},
   header:{flexDirection:"row",alignItems:"center",justifyContent:"space-between",paddingHorizontal:20,paddingTop:8,paddingBottom:12},
   logo:{color:"#c9a84c",fontSize:18,fontWeight:"700",letterSpacing:4},
-  greeting:{color:"#e8e0d0",fontSize:14},
   headerActions:{flexDirection:"row",alignItems:"center",gap:14},
   settingsIcon:{color:"#9e978a",fontSize:16},
   deleteData:{color:"#c44a3f",fontSize:11},
