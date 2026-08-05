@@ -1,13 +1,17 @@
 import { useEffect, useState } from "react";
 import { Redirect } from "expo-router";
 import { View, ActivityIndicator } from "react-native";
-import { getStoredUser } from "../services/auth";
+import { getStoredUser, hasAiConsent } from "../services/auth";
 
 export default function Index() {
   const [dest, setDest] = useState<string | null>(null);
 
   useEffect(() => {
-    getStoredUser().then(u => setDest(u ? "/(main)/home" : "/sign-in"));
+    (async () => {
+      const u = await getStoredUser();
+      if (!u) { setDest("/sign-in"); return; }
+      setDest((await hasAiConsent()) ? "/(main)/home" : "/consent");
+    })();
   }, []);
 
   if (!dest) {

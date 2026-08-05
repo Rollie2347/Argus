@@ -2,7 +2,7 @@ import { useState } from "react";
 import { View, Text, TextInput, TouchableOpacity, StyleSheet, ActivityIndicator, KeyboardAvoidingView, Platform, Linking } from "react-native";
 import { router } from "expo-router";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { saveUser } from "../services/auth";
+import { saveUser, hasAiConsent } from "../services/auth";
 import { BACKEND } from "../services/websocket";
 
 export default function SignIn() {
@@ -15,6 +15,7 @@ export default function SignIn() {
     setLoading(true);
     try {
       await saveUser(name.trim());
+      if (!(await hasAiConsent())) { router.replace("/consent"); return; }
       const seen = await AsyncStorage.getItem("argus_onboarded");
       if (seen) router.replace("/(main)/home");
       else router.replace("/onboarding");

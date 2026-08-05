@@ -232,6 +232,7 @@ wss.on("connection", async (clientWs, req) => {
   let session = null;
   let audioChunks = 0;
   let imageFrames = 0;
+  let transcriptBuffer = "";
 
   try {
     // Build dynamic system instruction with live memory, weather + location context
@@ -242,6 +243,11 @@ wss.on("connection", async (clientWs, req) => {
       model: MODEL,
       config: {
         responseModalities: [Modality.AUDIO],
+        // Live API only emits `msg.text` for TEXT-modality responses. This
+        // session is AUDIO-only, so without requesting a transcript here,
+        // there is no text at all to caption — closed captions had nothing
+        // to display regardless of the mobile-side toggle.
+        outputAudioTranscription: {},
         speechConfig: {
           voiceConfig: {
             prebuiltVoiceConfig: { voiceName: "Puck" },
@@ -308,13 +314,26 @@ wss.on("connection", async (clientWs, req) => {
               clientWs.send(JSON.stringify({ type: "audio", data: audioB64 }));
             }
 
-            // Handle text response
+            // Handle text response (TEXT-modality only — unused today, kept
+            // for compatibility if responseModalities ever changes)
             if (msg.text) {
               clientWs.send(JSON.stringify({ type: "text", data: msg.text }));
             }
 
+            // Buffer the spoken-audio transcript as it streams in, then flush
+            // it as one caption line when the turn completes — matches how
+            // the audio itself arrives in chunks and avoids fragmenting the
+            // transcript into many tiny lines client-side.
+            if (msg.serverContent && msg.serverContent.outputTranscription && msg.serverContent.outputTranscription.text) {
+              transcriptBuffer += msg.serverContent.outputTranscription.text;
+            }
+
             // Handle turn complete
             if (msg.serverContent && msg.serverContent.turnComplete) {
+              if (transcriptBuffer) {
+                clientWs.send(JSON.stringify({ type: "text", data: transcriptBuffer }));
+                transcriptBuffer = "";
+              }
               clientWs.send(JSON.stringify({ type: "turn_complete" }));
             }
           } catch (err) {

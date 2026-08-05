@@ -5,7 +5,13 @@ import { BACKEND } from "./websocket";
 
 export type User = { id: string; name: string; email: string };
 
-const SECRET_KEY = "argus_secret";
+// Keyed per-userId rather than one fixed key. iOS Keychain (unlike
+// AsyncStorage) survives app deletion, so a fixed key could resurrect a
+// secret that belongs to a *previous* install's uid — silently skipping
+// claim for the new uid and permanently orphaning it (401/403 forever,
+// with no retry ever firing since the stale value reads as "already have
+// one"). Scoping by id means a fresh uid never sees a stale value.
+function secretKey(id: string) { return `argus_secret_${id}`; }
 
 // Claims (or re-claims) this device's secret so destructive calls (e.g.
 // delete) can be authorized instead of trusting the id alone. Safe to retry:
@@ -17,7 +23,7 @@ async function claimSecret(id: string): Promise<string | null> {
     const r = await fetch(`${BACKEND}/api/user/${id}/claim`, { method: "POST" });
     if (r.ok) {
       const { secret } = await r.json();
-      if (secret) { await SecureStore.setItemAsync(SECRET_KEY, secret); return secret; }
+      if (secret) { await SecureStore.setItemAsync(secretKey(id), secret); return secret; }
     }
   } catch {}
   return null;
@@ -29,7 +35,7 @@ export async function saveUser(name: string): Promise<User> {
     id = "u_" + Crypto.randomUUID();
     await AsyncStorage.setItem("argus_uid", id);
   }
-  if (!(await SecureStore.getItemAsync(SECRET_KEY))) await claimSecret(id);
+  if (!(await SecureStore.getItemAsync(secretKey(id)))) await claimSecret(id);
   const user: User = { id, name: name.trim(), email: "" };
   await AsyncStorage.setItem("argus_user", JSON.stringify(user));
   return user;
@@ -44,8 +50,18 @@ export async function signOut() {
   await AsyncStorage.removeItem("argus_user");
 }
 
+const AI_CONSENT_KEY = "argus_ai_data_consent";
+
+export async function hasAiConsent(): Promise<boolean> {
+  return (await AsyncStorage.getItem(AI_CONSENT_KEY)) === "1";
+}
+
+export async function setAiConsent(): Promise<void> {
+  await AsyncStorage.setItem(AI_CONSENT_KEY, "1");
+}
+
 export async function deleteAccount(userId: string): Promise<boolean> {
-  let secret = await SecureStore.getItemAsync(SECRET_KEY);
+  let secret = await SecureStore.getItemAsync(secretKey(userId));
   if (!secret) secret = await claimSecret(userId);
   try {
     const r = await fetch(`${BACKEND}/api/user/${userId}`, {
@@ -56,7 +72,7 @@ export async function deleteAccount(userId: string): Promise<boolean> {
   } catch {
     return false;
   }
-  await AsyncStorage.multiRemove(["argus_user", "argus_uid", "argus_onboarded"]);
-  await SecureStore.deleteItemAsync(SECRET_KEY).catch(() => {});
+  await AsyncStorage.multiRemove(["argus_user", "argus_uid", "argus_onboarded", AI_CONSENT_KEY]);
+  await SecureStore.deleteItemAsync(secretKey(userId)).catch(() => {});
   return true;
 }

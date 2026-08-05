@@ -15,11 +15,14 @@
 </head>
 <body>
 <h1>◉ Argus — Privacy Policy</h1>
-<p class="updated">Last updated: July 16, 2026</p>
+<p class="updated">Last updated: August 5, 2026</p>
 
 <p>Argus ("the app") is an AI companion that uses your device's camera and microphone,
-together with Google's Gemini Live API, to see, hear, and respond to you in real time.
-This page explains what data the app handles and how.</p>
+together with Google's Gemini Live API — a third-party AI service — to see, hear, and
+respond to you in real time. This page explains what data the app collects, how it
+collects it, and every use and third-party share of that data. Before Argus ever sends
+anything, the app itself asks for your explicit, in-app permission — this page is not
+the only place that disclosure is made.</p>
 
 <h2>What we collect</h2>
 <ul>
@@ -36,11 +39,17 @@ This page explains what data the app handles and how.</p>
   connection, used only to give locally relevant weather context.</li>
 </ul>
 
-<h2>How it's used</h2>
-<p>Camera and microphone data is sent to Google's Gemini Live API to generate Argus's
-responses. Google's handling of this data is governed by
-<a href="https://ai.google.dev/gemini-api/terms" target="_blank" rel="noopener">Google's Gemini API terms</a>.
-Your stored preferences, lists, and activity logs are kept in Google Cloud Firestore,
+<h2>Who we share it with, and why</h2>
+<p><strong>Google's Gemini Live API</strong> is the only third party we send your personal
+data to, and only for the purpose of generating Argus's live responses: camera video,
+microphone audio, and any stored preferences relevant to the conversation (e.g.
+allergies, so Argus doesn't recommend something unsafe) are streamed to it while you
+are actively connected. Google's handling of this data is governed by
+<a href="https://ai.google.dev/gemini-api/terms" target="_blank" rel="noopener">Google's Gemini API terms</a>,
+which commit to not using data sent via the API to train Google's models and to
+comparable safeguards for how it's transmitted and processed. We do not sell or share
+your data with any other third party, advertiser, or data broker.</p>
+<p>Your stored preferences, lists, and activity logs are kept in Google Cloud Firestore,
 associated only with the random device identifier described above — never with your
 name, email, or any other real-world identity we collect.</p>
 
