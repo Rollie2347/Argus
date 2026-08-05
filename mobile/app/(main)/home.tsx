@@ -113,6 +113,7 @@ export default function Home() {
   const [thinkingHint, setThinkingHint] = useState<string|null>(null);
   const [errors, setErrors] = useState<{id:number; text:string}[]>([]);
   const [facing, setFacing] = useState<"front"|"back">("back");
+  const [deletingData, setDeletingData] = useState(false);
   const { captionsEnabled } = useCaptions();
   const [toolStatus, setToolStatus] = useState<string|null>(null);
   const [camPerm, requestCam] = useCameraPermissions();
@@ -287,17 +288,27 @@ export default function Home() {
   function flipCamera() { setFacing(f => (f === "back" ? "front" : "back")); }
 
   function confirmDeleteData() {
-    if (!user) return;
+    if (!user || deletingData) return;
     Alert.alert(
       "Delete my data",
       "This permanently deletes everything Argus remembers about you. This can't be undone.",
       [
         { text: "Cancel", style: "cancel" },
         { text: "Delete", style: "destructive", onPress: async () => {
-          disconnect();
-          const ok = await deleteAccount(user.id);
-          if (ok) router.replace("/sign-in");
-          else Alert.alert("Couldn't delete data", "Something went wrong. Check your connection and try again.");
+          setDeletingData(true);
+          try {
+            disconnect();
+            const ok = await deleteAccount(user.id);
+            if (ok) { router.replace("/sign-in"); return; }
+            Alert.alert("Couldn't delete data", "Something went wrong. Check your connection and try again.");
+          } catch {
+            // Any unexpected throw here (network, storage, etc.) must still
+            // surface something — a silent failure previously left the UI
+            // looking unresponsive with no error and no navigation.
+            Alert.alert("Couldn't delete data", "Something went wrong. Check your connection and try again.");
+          } finally {
+            setDeletingData(false);
+          }
         } },
       ]
     );
@@ -311,8 +322,8 @@ export default function Home() {
       <View style={s.header}>
         <Text style={s.logo}>◉ ARGUS</Text>
         <View style={s.headerActions}>
-          <TouchableOpacity onPress={confirmDeleteData}>
-            <Text style={s.deleteData}>Delete my data</Text>
+          <TouchableOpacity onPress={confirmDeleteData} disabled={deletingData}>
+            <Text style={s.deleteData}>{deletingData ? "Deleting…" : "Delete my data"}</Text>
           </TouchableOpacity>
           <TouchableOpacity onPress={() => router.push("/(main)/settings")}>
             <Text style={s.settingsIcon}>⚙</Text>

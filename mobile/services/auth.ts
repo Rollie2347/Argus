@@ -72,7 +72,14 @@ export async function deleteAccount(userId: string): Promise<boolean> {
   } catch {
     return false;
   }
-  await AsyncStorage.multiRemove(["argus_user", "argus_uid", "argus_onboarded", AI_CONSENT_KEY]);
-  await SecureStore.deleteItemAsync(secretKey(userId)).catch(() => {});
+  // The server-side delete already succeeded at this point. Local cleanup is
+  // best-effort and must not make an already-successful delete look like it
+  // silently failed — an unhandled rejection here previously left the caller
+  // awaiting a promise that never resolved or rejected visibly, with no
+  // error and no navigation.
+  try {
+    await AsyncStorage.multiRemove(["argus_user", "argus_uid", "argus_onboarded", AI_CONSENT_KEY]);
+    await SecureStore.deleteItemAsync(secretKey(userId));
+  } catch {}
   return true;
 }
