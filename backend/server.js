@@ -271,21 +271,15 @@ wss.on("connection", async (clientWs, req) => {
         // there is no text at all to caption — closed captions had nothing
         // to display regardless of the mobile-side toggle.
         outputAudioTranscription: {},
-        // Mobile's audio capture loop (home.tsx) stops/restarts a fresh
-        // Audio.Recording every ~1s rather than streaming continuously,
-        // which injects real silence gaps into what Gemini receives. The
-        // SDK default silenceDurationMs (~800ms) was tripping on those gaps
-        // mid-sentence, ending the user's turn early; the next chunk then
-        // reads as new activity and barge-in-interrupts Gemini's own
-        // response (default activityHandling is START_OF_ACTIVITY_INTERRUPTS).
-        // Widening the silence tolerance is a mitigation, not a fix for the
-        // capture gap itself — see CLAUDE.md known issues for the full trace.
-        realtimeInputConfig: {
-          automaticActivityDetection: {
-            silenceDurationMs: 1500,
-            prefixPaddingMs: 300,
-          },
-        },
+        // Reverted 2026-08-07: an explicit realtimeInputConfig.automaticActivityDetection
+        // (silenceDurationMs/prefixPaddingMs) was added here as a Bug 1 mitigation, but
+        // the very first live session on the revision that shipped it hit a fatal
+        // "Gemini session closed 1007 CONTENT_TYPE_AUDIO is not supported for this model
+        // configuration" mid-conversation, right after a barge-in interruption — an error
+        // never seen once in the prior 30 days of logs. Single data point, not proven,
+        // but a full crash outweighs the mid-sentence-interruption annoyance it was
+        // mitigating — back off to Gemini's defaults until this can be confirmed safe.
+        // See CLAUDE.md known issues for the full trace.
         speechConfig: {
           voiceConfig: {
             prebuiltVoiceConfig: { voiceName: "Puck" },

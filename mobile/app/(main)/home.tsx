@@ -186,9 +186,13 @@ export default function Home() {
           await new Promise(r => setTimeout(r, CHUNK_MS));
           await rec.stopAndUnloadAsync();
           const uri = rec.getURI();
-          if (uri && socketRef.current?.ready) {
-            const b64 = await getAudioB64(uri);
-            socketRef.current.sendAudio(b64);
+          // Encode + send run off the loop's critical path so the mic comes
+          // back up immediately instead of sitting idle through a network
+          // round trip — that wait was the dominant chunk of dead-air in
+          // each ~1s cycle and was audible as cutting in and out.
+          if (uri) {
+            const sock = socketRef.current;
+            getAudioB64(uri).then(b64 => { if (sock?.ready) sock.sendAudio(b64); }).catch(() => {});
           }
         } catch (e) { try { await rec.stopAndUnloadAsync(); } catch {} }
       } else { await new Promise(r => setTimeout(r, 200)); }
@@ -362,7 +366,7 @@ export default function Home() {
             {errors.map(e => <ErrorToast key={e.id} text={e.text} onDone={() => setErrors(prev => prev.filter(x => x.id !== e.id))} />)}
           </View>
         )}
-        {captionsEnabled && (lines.length > 0 || toolStatus) && (
+        {captionsEnabled && lines.length > 0 && (
           <View style={s.transcriptOverlay}>
             <ScrollView ref={scrollRef} contentContainerStyle={{padding:16}}>
               {lines.map((l,i) => (
@@ -370,8 +374,12 @@ export default function Home() {
                   {l.role==="argus" ? "◉ " : ""}{l.text}
                 </Text>
               ))}
-              {toolStatus && <Text style={s.lineTool}>{toolStatus}</Text>}
             </ScrollView>
+          </View>
+        )}
+        {toolStatus && (
+          <View style={s.toolStatusFloating} pointerEvents="none">
+            <Text style={s.toolStatusTxt}>{toolStatus}</Text>
           </View>
         )}
       </View>
@@ -420,7 +428,8 @@ const s = StyleSheet.create({
   transcriptOverlay:{position:"absolute",left:0,right:0,bottom:0,maxHeight:"45%",backgroundColor:"rgba(8,8,12,0.78)"},
   line:{fontSize:14,color:"#9e978a",marginBottom:6,lineHeight:22},
   lineArgus:{color:"#c9a84c"},
-  lineTool:{fontSize:11,color:"#8a6f2f"},
+  toolStatusFloating:{position:"absolute",bottom:16,left:16,backgroundColor:"rgba(8,8,12,0.75)",paddingHorizontal:12,paddingVertical:7,borderRadius:12,maxWidth:"70%"},
+  toolStatusTxt:{color:"#c9a84c",fontSize:12,letterSpacing:0.3},
   controls:{flexDirection:"row",justifyContent:"center",alignItems:"center",gap:20,paddingVertical:24},
   connectBtn:{width:64,height:64,borderRadius:32,borderWidth:2,borderColor:"#c9a84c",alignItems:"center",justifyContent:"center"},
   connectBtnActive:{backgroundColor:"#1a1408"},
