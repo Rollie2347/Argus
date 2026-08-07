@@ -226,20 +226,37 @@ export default function Home() {
     const chunks = audioQueueRef.current;
     audioQueueRef.current = [];
     isPlayingRef.current = true;
+    const pcmBytes = chunks.reduce((sum, b64) => sum + atob(b64).length, 0);
+    const expectedMs = (pcmBytes / (24000 * 2)) * 1000; // 24kHz, 16-bit mono
+    let settled = false;
+    let watchdog: ReturnType<typeof setTimeout> | null = null;
+    // Safety net for a stuck queue: if an OS audio-session interruption (a
+    // call, Siri, another app) unloads the sound without ever firing
+    // didJustFinish, isPlayingRef previously stayed true forever and every
+    // later burst just piled up in the queue with nothing ever playing again
+    // — reads to the user as "Argus stopped mid-response." Force-advance
+    // after a generous multiple of the clip's own expected duration.
+    const finishPlayback = () => {
+      if (settled) return;
+      settled = true;
+      if (watchdog) clearTimeout(watchdog);
+      isPlayingRef.current = false;
+      playNextInQueue();
+    };
     try {
       const wavB64 = pcmChunksToWavBase64(chunks, 24000);
       const { sound } = await Audio.Sound.createAsync({ uri: `data:audio/wav;base64,${wavB64}` }, { shouldPlay: true });
       soundRef.current = sound;
+      watchdog = setTimeout(() => {
+        try { sound.unloadAsync(); } catch {}
+        finishPlayback();
+      }, Math.max(6000, expectedMs * 2 + 5000));
       sound.setOnPlaybackStatusUpdate((st) => {
-        if (st.isLoaded && st.didJustFinish) {
-          sound.unloadAsync();
-          isPlayingRef.current = false;
-          playNextInQueue();
-        }
+        if (!st.isLoaded) { finishPlayback(); return; }
+        if (st.didJustFinish) { sound.unloadAsync(); finishPlayback(); }
       });
     } catch (e) {
-      isPlayingRef.current = false;
-      playNextInQueue();
+      finishPlayback();
     }
   }
 

@@ -141,6 +141,13 @@ const MAX_AUDIO_B64_LEN = 200_000; // ~150KB raw — generous for a 1s 16kHz/16-
 const MAX_IMAGE_B64_LEN = 3_000_000; // ~2.2MB raw — generous for a quality:0.5 JPEG frame
 const connectionsByIp = new Map();
 
+// Per-IP geolocation cache (mirrors weather.js's location cache). The
+// ipapi.co lookup below was measured adding ~150-500ms to every single
+// connection open, not just first load — cache it so reconnects from the
+// same IP skip the round trip.
+const geoCache = new Map();
+const GEO_CACHE_DURATION = 30 * 60 * 1000;
+
 function validSecret(secret) {
   if (typeof secret !== "string" || !secret) return false;
   const a = Buffer.from(secret);
@@ -219,10 +226,20 @@ wss.on("connection", async (clientWs, req) => {
   let userLon = parseFloat(process.env.WEATHER_LON) || -87.63;
   let userCity = process.env.WEATHER_CITY || "your area";
   if (ip && !ip.includes("127.0.0.1") && !ip.includes("::1")) {
-    try {
-      const geo = await (await fetch("https://ipapi.co/" + ip + "/json/", { signal: AbortSignal.timeout(3000) })).json();
-      if (geo.latitude) { userLat = geo.latitude; userLon = geo.longitude; userCity = [geo.city, geo.region_code].filter(Boolean).join(", ") || "your area"; console.log("📍 Location:", userCity); }
-    } catch (e) { console.warn("Geolocation failed:", e.message); }
+    const cachedGeo = geoCache.get(ip);
+    if (cachedGeo && Date.now() - cachedGeo.time < GEO_CACHE_DURATION) {
+      ({ lat: userLat, lon: userLon, city: userCity } = cachedGeo.data);
+    } else {
+      try {
+        const geo = await (await fetch("https://ipapi.co/" + ip + "/json/", { signal: AbortSignal.timeout(3000) })).json();
+        if (geo.latitude) {
+          userLat = geo.latitude; userLon = geo.longitude;
+          userCity = [geo.city, geo.region_code].filter(Boolean).join(", ") || "your area";
+          console.log("📍 Location:", userCity);
+          geoCache.set(ip, { data: { lat: userLat, lon: userLon, city: userCity }, time: Date.now() });
+        }
+      } catch (e) { console.warn("Geolocation failed:", e.message); }
+    }
   }
 
   let userId = auth.id;
@@ -233,6 +250,12 @@ wss.on("connection", async (clientWs, req) => {
   let audioChunks = 0;
   let imageFrames = 0;
   let transcriptBuffer = "";
+  // Turn-latency instrumentation (Bug 2 investigation): timestamp of the
+  // last audio chunk forwarded to Gemini, and whether a response is
+  // currently in flight — lets us log how long Gemini actually took to
+  // start responding, separate from connection-open latency.
+  let lastAudioForwardedAt = 0;
+  let responseInFlight = false;
 
   try {
     // Build dynamic system instruction with live memory, weather + location context
@@ -248,6 +271,21 @@ wss.on("connection", async (clientWs, req) => {
         // there is no text at all to caption — closed captions had nothing
         // to display regardless of the mobile-side toggle.
         outputAudioTranscription: {},
+        // Mobile's audio capture loop (home.tsx) stops/restarts a fresh
+        // Audio.Recording every ~1s rather than streaming continuously,
+        // which injects real silence gaps into what Gemini receives. The
+        // SDK default silenceDurationMs (~800ms) was tripping on those gaps
+        // mid-sentence, ending the user's turn early; the next chunk then
+        // reads as new activity and barge-in-interrupts Gemini's own
+        // response (default activityHandling is START_OF_ACTIVITY_INTERRUPTS).
+        // Widening the silence tolerance is a mitigation, not a fix for the
+        // capture gap itself — see CLAUDE.md known issues for the full trace.
+        realtimeInputConfig: {
+          automaticActivityDetection: {
+            silenceDurationMs: 1500,
+            prefixPaddingMs: 300,
+          },
+        },
         speechConfig: {
           voiceConfig: {
             prebuiltVoiceConfig: { voiceName: "Puck" },
@@ -270,6 +308,22 @@ wss.on("connection", async (clientWs, req) => {
           if (clientWs.readyState !== WebSocket.OPEN) return;
 
           try {
+            // First sign of a new turn's response (tool call, audio, or
+            // transcript text) after the user finished talking — logs how
+            // long Gemini actually took to start responding, separate from
+            // connection-open latency.
+            const isResponseActivity = !!(msg.toolCall || msg.data || (msg.serverContent && msg.serverContent.outputTranscription && msg.serverContent.outputTranscription.text));
+            if (isResponseActivity && !responseInFlight) {
+              responseInFlight = true;
+              if (lastAudioForwardedAt) {
+                console.log(`⏱️ Turn latency: ${Date.now() - lastAudioForwardedAt}ms`);
+              }
+            }
+
+            if (msg.serverContent && msg.serverContent.interrupted) {
+              console.log("⚡ Gemini interrupted its own response (barge-in)");
+            }
+
             // Handle tool calls from Gemini
             if (msg.toolCall) {
               console.log("🔧 Tool call:", JSON.stringify(msg.toolCall).substring(0, 200));
@@ -335,6 +389,7 @@ wss.on("connection", async (clientWs, req) => {
                 transcriptBuffer = "";
               }
               clientWs.send(JSON.stringify({ type: "turn_complete" }));
+              responseInFlight = false;
             }
           } catch (err) {
             console.error("Error processing Gemini message:", err.message);
@@ -342,7 +397,11 @@ wss.on("connection", async (clientWs, req) => {
         },
 
         onerror: (err) => {
-          console.error("Gemini error:", JSON.stringify(err).substring(0, 300));
+          // JSON.stringify(err) on an ErrorEvent-like object frequently
+          // serializes to "{}" since .message/.error aren't always
+          // own-enumerable — log the actual fields so a real occurrence is
+          // diagnosable instead of leaving no trace of why it happened.
+          console.error("Gemini error:", err?.message || err?.error?.message || JSON.stringify(err).substring(0, 300));
           if (clientWs.readyState === WebSocket.OPEN) {
             clientWs.send(JSON.stringify({ type: "error", data: "Connection error" }));
             // Gemini-side errors aren't reliably followed by onclose — close the
@@ -353,7 +412,10 @@ wss.on("connection", async (clientWs, req) => {
         },
 
         onclose: (ev) => {
-          console.log("Gemini session closed");
+          // CloseEvent carries the real reason (code/reason/wasClean) — this
+          // was previously discarded, leaving no way to tell a normal
+          // client-initiated close from a genuine Gemini-side drop.
+          console.log("Gemini session closed", ev?.code, ev?.reason || "(no reason given)");
           if (clientWs.readyState === WebSocket.OPEN) {
             clientWs.close();
           }
@@ -382,6 +444,7 @@ wss.on("connection", async (clientWs, req) => {
               mimeType: "audio/pcm;rate=16000",
             },
           });
+          lastAudioForwardedAt = Date.now();
         } else if (msg.type === "user_id" && msg.id) {
           if (typeof msg.id !== "string" || msg.id.length > 200) return;
           userId = msg.id;

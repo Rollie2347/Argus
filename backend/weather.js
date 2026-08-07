@@ -19,7 +19,11 @@ export async function getWeather(
   try {
     const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,weathercode,windspeed_10m,relative_humidity_2m&daily=temperature_2m_max,temperature_2m_min,sunrise,sunset,weathercode&temperature_unit=fahrenheit&timezone=auto&forecast_days=2`;
 
-    const resp = await fetch(url);
+    // Unlike the geo lookup (which has an explicit 3s AbortSignal.timeout),
+    // this fetch previously had no timeout at all — a slow/hanging
+    // Open-Meteo response could silently stretch connection-open latency
+    // past what every other stage in buildSystemInstruction is bounded by.
+    const resp = await fetch(url, { signal: AbortSignal.timeout(3000) });
     const data = await resp.json();
 
     const current = data.current;
