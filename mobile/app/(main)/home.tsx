@@ -206,7 +206,11 @@ export default function Home() {
     frameIntervalRef.current = setInterval(async () => {
       if (!cameraRef.current || !socketRef.current?.ready) return;
       try {
-        const photo = await cameraRef.current.takePictureAsync({ base64: true, quality: 0.5, skipProcessing: true });
+        // takePictureAsync defaults shutterSound to true — with a real photo
+        // capture firing every FRAME_MS for the whole session, that meant a
+        // shutter click on every single frame, continuously, for as long as
+        // the session stayed connected.
+        const photo = await cameraRef.current.takePictureAsync({ base64: true, quality: 0.5, skipProcessing: true, shutterSound: false });
         if (photo?.base64 && socketRef.current?.ready) socketRef.current.sendImage(photo.base64);
       } catch (e) { /* camera transiently busy — skip this tick */ }
     }, FRAME_MS);
