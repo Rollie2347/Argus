@@ -52,6 +52,24 @@ variable "timezone" {
   default     = "America/Chicago"
 }
 
+variable "max_global_concurrent_sessions" {
+  description = "Fleet-wide cap on concurrent WebSocket/Gemini sessions across all Cloud Run instances"
+  type        = string
+  default     = "250"
+}
+
+variable "billing_account_id" {
+  description = "Billing account ID (format XXXXXX-XXXXXX-XXXXXX, from `gcloud billing accounts list`) to attach a budget alert to. Leave empty to skip creating the budget — there is otherwise NO spend cap anywhere in this stack, and a Gemini Live API bill scales directly with concurrent open connections."
+  type        = string
+  default     = ""
+}
+
+variable "monthly_budget_usd" {
+  description = "Monthly budget amount (USD) that triggers alert emails to billing account admins at 50%/90%/100%/150% of this figure. Only used if billing_account_id is set."
+  type        = number
+  default     = 500
+}
+
 provider "google" {
   project = var.project_id
   region  = var.region
@@ -126,17 +144,32 @@ resource "google_cloud_run_v2_service" "argus" {
         value = var.timezone
       }
 
+      env {
+        name  = "MAX_GLOBAL_CONCURRENT_SESSIONS"
+        value = var.max_global_concurrent_sessions
+      }
+
       resources {
         limits = {
           cpu    = "1"
-          memory = "512Mi"
+          memory = "1Gi"
         }
       }
     }
 
+    # Explicit concurrency (was left at Cloud Run's implicit default of 80,
+    # which a local relay-load test showed getting close to 512Mi's ceiling
+    # on relay overhead alone, before the real @google/genai SDK's own
+    # per-connection upstream-session overhead is even added). 40 * 15
+    # max-instances = 600 slots, comfortably over the 200-concurrent-user
+    # target with headroom for uneven distribution across instances (session
+    # affinity means reconnects stick to one instance, so load isn't always
+    # balanced evenly).
+    max_instance_request_concurrency = 40
+
     scaling {
       min_instance_count = 0
-      max_instance_count = 10
+      max_instance_count = 15
     }
 
     session_affinity = true
@@ -156,6 +189,38 @@ resource "google_cloud_run_v2_service_iam_member" "public" {
   name     = google_cloud_run_v2_service.argus.name
   role     = "roles/run.invoker"
   member   = "allUsers"
+}
+
+# Budget alert — there's no hard spend cap anywhere in this stack (Gemini
+# Live billing scales with concurrent open connections, and the WS auth
+# secret is readable in the public page's HTML per known issue #12), so
+# this is the backstop that turns "silent runaway bill" into "an email
+# fires." Optional (count=0 skips it) since billing_account_id has no safe
+# default — get it from `gcloud billing accounts list` and pass it via
+# `-var="billing_account_id=..."`, or set TF_VAR_billing_account_id.
+resource "google_billing_budget" "argus_budget" {
+  count           = var.billing_account_id != "" ? 1 : 0
+  billing_account = var.billing_account_id
+  display_name    = "Argus monthly budget"
+
+  budget_filter {
+    projects = ["projects/${var.project_id}"]
+  }
+
+  amount {
+    specified_amount {
+      currency_code = "USD"
+      units         = tostring(var.monthly_budget_usd)
+    }
+  }
+
+  threshold_rules { threshold_percent = 0.5 }
+  threshold_rules { threshold_percent = 0.9 }
+  threshold_rules { threshold_percent = 1.0 }
+  threshold_rules { threshold_percent = 1.5 }
+  # No monitoring_notification_channels set — defaults to emailing billing
+  # account admins/users, no extra Pub/Sub or notification-channel infra
+  # needed for a first pass.
 }
 
 # Output the service URL

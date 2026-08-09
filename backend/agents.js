@@ -16,6 +16,9 @@ import {
   addObservation,
   getRecentObservations,
   buildMemoryContext,
+  boundPreferences,
+  upsertPreference,
+  appendUserListField,
 } from "./memory.js";
 import { getWeather, weatherToContext } from "./weather.js";
 
@@ -260,8 +263,8 @@ export async function handleToolCall(functionCall, userId) {
       const userMem = await getUserMemory(userId);
       return {
         ingredients: args.ingredients,
-        dietary: userMem.dietaryPreferences || "none specified",
-        allergies: userMem.allergies || "none specified",
+        dietary: userMem.dietaryPreferences && userMem.dietaryPreferences.length ? userMem.dietaryPreferences : "none specified",
+        allergies: userMem.allergies && userMem.allergies.length ? userMem.allergies : "none specified",
         time: args.time_available_minutes || "not specified",
         suggestion: `Suggesting recipe with: ${args.ingredients.join(", ")}`,
       };
@@ -323,27 +326,55 @@ export async function handleToolCall(functionCall, userId) {
     }
 
     case "remember_preference": {
-      const update = {};
-      if (args.category === "dietary") update.dietaryPreferences = args.value;
-      else if (args.category === "allergy") update.allergies = args.value;
-      else if (args.category === "personal" && args.key === "name") update.name = args.value;
-      else {
-        // set() with {merge:true} treats a top-level key literally, it does not
-        // split "preferences.foo" into a nested path the way update() does — so
-        // merge the existing map in JS and write it back as a real nested object.
-        const current = await getUserMemory(userId);
-        update.preferences = { ...(current.preferences || {}), [args.key]: args.value };
-      }
-      await updateUserMemory(userId, update);
+      // dietary/allergy are lists now, not last-write-wins scalars — a
+      // second distinct allergy mention used to silently erase the first
+      // (a real safety bug: allergies feed recipe-safety personalization).
+      // appendUserListField/upsertPreference also run inside a Firestore
+      // transaction, closing the read-then-write race that two overlapping
+      // remember_preference calls could previously hit (CLAUDE.md known
+      // issue #16's flagged residual risk).
+      if (args.category === "dietary") await appendUserListField(userId, "dietaryPreferences", args.value);
+      else if (args.category === "allergy") await appendUserListField(userId, "allergies", args.value);
+      else if (args.category === "personal" && args.key === "name") await updateUserMemory(userId, { name: args.value });
+      else await upsertPreference(userId, args.key, args.value);
       return { stored: true, category: args.category, key: args.key, value: args.value };
     }
 
     case "recall_memory": {
-      if (args.query_type === "preferences") return await getUserMemory(userId);
+      // Never spread the raw Firestore doc back to Gemini — it also holds
+      // `deviceSecret` (the bearer credential that authorizes destructive
+      // account-delete calls). The old "preferences"/"all" cases returned
+      // getUserMemory(userId) / built on it directly, which leaked that
+      // secret into a tool response the model could read or repeat back.
+      if (args.query_type === "preferences") {
+        const mem = await getUserMemory(userId);
+        return {
+          name: mem.name || null,
+          dietaryPreferences: mem.dietaryPreferences || [],
+          allergies: mem.allergies || [],
+          preferences: boundPreferences(mem.preferences),
+        };
+      }
       if (args.query_type === "today") return await getDailyLog(userId);
       if (args.query_type === "shopping_list") return { items: await getShoppingList(userId) };
       if (args.query_type === "recent_observations") return { observations: await getRecentObservations(userId, 10) };
-      if (args.query_type === "all") return { memory: await buildMemoryContext(userId) };
+      if (args.query_type === "all") {
+        const [mem, dailyLog, shoppingList, recentObs] = await Promise.all([
+          getUserMemory(userId),
+          getDailyLog(userId),
+          getShoppingList(userId),
+          getRecentObservations(userId, 10),
+        ]);
+        return {
+          name: mem.name || null,
+          dietaryPreferences: mem.dietaryPreferences || [],
+          allergies: mem.allergies || [],
+          preferences: boundPreferences(mem.preferences),
+          today: dailyLog.entries || [],
+          shopping_list: shoppingList,
+          recent_observations: recentObs,
+        };
+      }
       return {};
     }
 

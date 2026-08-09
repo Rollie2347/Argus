@@ -9,8 +9,9 @@ WS_SHARED_SECRET="${2:-$WS_SHARED_SECRET}"
 WEATHER_LAT="${3:-${WEATHER_LAT:-41.88}}"
 WEATHER_LON="${4:-${WEATHER_LON:--87.63}}"
 TIMEZONE="${5:-${TIMEZONE:-America/Chicago}}"
+MAX_GLOBAL_CONCURRENT_SESSIONS="${6:-${MAX_GLOBAL_CONCURRENT_SESSIONS:-250}}"
 if [ -z "$GEMINI_API_KEY" ] || [ -z "$WS_SHARED_SECRET" ]; then
-  echo "Usage: ./deploy-cloudrun.sh <GEMINI_API_KEY> <WS_SHARED_SECRET> [WEATHER_LAT] [WEATHER_LON] [TIMEZONE]"
+  echo "Usage: ./deploy-cloudrun.sh <GEMINI_API_KEY> <WS_SHARED_SECRET> [WEATHER_LAT] [WEATHER_LON] [TIMEZONE] [MAX_GLOBAL_CONCURRENT_SESSIONS]"
   echo "Generate a shared secret with: node -e \"console.log(require('crypto').randomBytes(32).toString('hex'))\""
   exit 1
 fi
@@ -35,12 +36,13 @@ gcloud run deploy $SERVICE_NAME \
   --source . \
   --region $REGION \
   --allow-unauthenticated \
-  --set-env-vars "GEMINI_API_KEY=$GEMINI_API_KEY,WS_SHARED_SECRET=$WS_SHARED_SECRET,GCP_PROJECT_ID=$PROJECT_ID,WEATHER_LAT=$WEATHER_LAT,WEATHER_LON=$WEATHER_LON,TIMEZONE=$TIMEZONE" \
+  --set-env-vars "GEMINI_API_KEY=$GEMINI_API_KEY,WS_SHARED_SECRET=$WS_SHARED_SECRET,GCP_PROJECT_ID=$PROJECT_ID,WEATHER_LAT=$WEATHER_LAT,WEATHER_LON=$WEATHER_LON,TIMEZONE=$TIMEZONE,MAX_GLOBAL_CONCURRENT_SESSIONS=$MAX_GLOBAL_CONCURRENT_SESSIONS" \
   --port 8080 \
-  --memory 512Mi \
+  --memory 1Gi \
   --cpu 1 \
   --min-instances 0 \
-  --max-instances 10 \
+  --max-instances 15 \
+  --concurrency 40 \
   --timeout 3600 \
   --session-affinity
 URL=$(gcloud run services describe $SERVICE_NAME --region $REGION --format="value(status.url)")
@@ -48,3 +50,14 @@ echo ""
 echo "Argus deployed!"
 echo "URL: $URL"
 echo "Open on your phone: $URL"
+echo ""
+echo "NOTE: there is still no billing budget alert configured. Gemini Live cost"
+echo "scales directly with concurrent open connections and there's no cap on"
+echo "spend itself (only on connection count, via MAX_GLOBAL_CONCURRENT_SESSIONS)."
+echo "Set one up with:"
+echo "  gcloud billing accounts list"
+echo "  gcloud billing budgets create --billing-account=<ACCOUNT_ID> \\"
+echo "    --display-name=\"Argus monthly budget\" --budget-amount=500USD \\"
+echo "    --filter-projects=projects/$PROJECT_ID \\"
+echo "    --threshold-rule=percent=0.5 --threshold-rule=percent=0.9 \\"
+echo "    --threshold-rule=percent=1.0 --threshold-rule=percent=1.5"

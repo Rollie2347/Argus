@@ -13,7 +13,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { WebSocketServer, WebSocket } from "ws";
 import { buildSystemInstruction, TOOLS, handleToolCall } from "./agents.js";
-import { deleteUserData, claimUserSecret, verifyDeviceSecret } from "./memory.js";
+import { deleteUserData, claimUserSecret, verifyDeviceSecret, reserveGlobalSlot, releaseGlobalSlot } from "./memory.js";
 
 dotenv.config();
 
@@ -135,6 +135,10 @@ app.use(express.static(frontendPath, { index: false }));
 const wss = new WebSocketServer({ server, path: "/ws", maxPayload: 4 * 1024 * 1024 });
 
 const WS_MAX_CONN_PER_IP = 5;
+// Fleet-wide budget so organic growth (or abuse) past this fails safe with a
+// clear rejection instead of silently becoming an uncapped Gemini bill —
+// connectionsByIp above only bounds a single IP, not total concurrent spend.
+const MAX_GLOBAL_CONCURRENT_SESSIONS = parseInt(process.env.MAX_GLOBAL_CONCURRENT_SESSIONS) || 250;
 const WS_MSG_RATE_LIMIT = 30; // messages/sec/connection
 const ALLOWED_WS_TYPES = new Set(["audio", "image", "user_id", "greet"]);
 const MAX_AUDIO_B64_LEN = 200_000; // ~150KB raw — generous for a 1s 16kHz/16-bit mono chunk
@@ -147,6 +151,19 @@ const connectionsByIp = new Map();
 // same IP skip the round trip.
 const geoCache = new Map();
 const GEO_CACHE_DURATION = 30 * 60 * 1000;
+
+// Strips anything that isn't a plausible place-name character before a
+// geo-lookup response is allowed into the Gemini system prompt (userCity) —
+// the lookup travels over plaintext HTTP (see fetch call below), so a
+// MITM-forged response body must not be able to smuggle prompt-injection
+// content (newlines, instruction-shaped text) into the prompt, only inert
+// wrong-location text at worst.
+function sanitizeLocationField(s) {
+  return String(s || "")
+    .replace(/[^\p{L}\p{N}\s,.'-]/gu, "")
+    .slice(0, 100)
+    .trim();
+}
 
 function validSecret(secret) {
   if (typeof secret !== "string" || !secret) return false;
@@ -220,6 +237,24 @@ wss.on("connection", async (clientWs, req) => {
     return;
   }
 
+  // Fleet-wide capacity check — must happen after auth (an unauthenticated
+  // connection should never consume a slot) and before opening the billed
+  // Gemini session below.
+  const slot = await reserveGlobalSlot(MAX_GLOBAL_CONCURRENT_SESSIONS);
+  if (!slot.allowed) {
+    console.warn(`Rejected connection — at global capacity (${slot.count}/${MAX_GLOBAL_CONCURRENT_SESSIONS})`);
+    clientWs.close(4029, "at capacity, try again shortly");
+    return;
+  }
+  let releasedGlobalSlot = false;
+  const releaseGlobal = () => {
+    if (releasedGlobalSlot) return;
+    releasedGlobalSlot = true;
+    releaseGlobalSlot(slot.shard);
+  };
+  clientWs.on("close", releaseGlobal);
+  clientWs.on("error", releaseGlobal);
+
   // Auto-detect user location via IP for personalised weather + context.
   // Runs only after auth succeeds, so a rejected connection never triggers it.
   let userLat = parseFloat(process.env.WEATHER_LAT) || 41.88;
@@ -231,10 +266,28 @@ wss.on("connection", async (clientWs, req) => {
       ({ lat: userLat, lon: userLon, city: userCity } = cachedGeo.data);
     } else {
       try {
-        const geo = await (await fetch("https://ipapi.co/" + ip + "/json/", { signal: AbortSignal.timeout(3000) })).json();
-        if (geo.latitude) {
-          userLat = geo.latitude; userLon = geo.longitude;
-          userCity = [geo.city, geo.region_code].filter(Boolean).join(", ") || "your area";
+        // ipapi.co's free tier caps at 1,000 req/day — nowhere near enough
+        // headroom at 200-concurrent-user scale (this fires once per
+        // connection open per uncached IP). ip-api.com's free tier is
+        // 45 req/min (~64,800/day) with no signup, but HTTP-only on the free
+        // tier (no HTTPS) — ipwho.is/ipapi.co both offer HTTPS but share the
+        // same ~1,000/day-per-caller ceiling that motivated moving off
+        // ipapi.co in the first place, so they don't actually fix the
+        // problem. Since a plaintext response here isn't tamper-proof in
+        // transit, both fields below are strictly validated/sanitized
+        // before they reach userLat/userLon/userCity — which flow into
+        // weather.js's URL and the Gemini system prompt respectively — so a
+        // MITM-forged response can't inject prompt content or malformed
+        // URL params, only (at worst) a wrong-but-inert location string.
+        const geo = await (await fetch(
+          "http://ip-api.com/json/" + ip + "?fields=status,lat,lon,city,regionName",
+          { signal: AbortSignal.timeout(3000) }
+        )).json();
+        const lat = Number(geo.lat), lon = Number(geo.lon);
+        const validCoords = Number.isFinite(lat) && Number.isFinite(lon) && Math.abs(lat) <= 90 && Math.abs(lon) <= 180;
+        if (geo.status === "success" && validCoords) {
+          userLat = lat; userLon = lon;
+          userCity = sanitizeLocationField([geo.city, geo.regionName].filter(Boolean).join(", ")) || "your area";
           console.log("📍 Location:", userCity);
           geoCache.set(ip, { data: { lat: userLat, lon: userLon, city: userCity }, time: Date.now() });
         }
@@ -271,6 +324,12 @@ wss.on("connection", async (clientWs, req) => {
         // there is no text at all to caption — closed captions had nothing
         // to display regardless of the mobile-side toggle.
         outputAudioTranscription: {},
+        // Without this, sessions that stream both audio AND video (Argus
+        // sends camera frames alongside mic audio in the same session) are
+        // hard-capped at 2 minutes per Gemini's Live API docs and silently
+        // terminate — no error, just an onclose. Sliding-window compression
+        // lets sessions run indefinitely instead.
+        contextWindowCompression: { slidingWindow: {} },
         // Reverted 2026-08-07: an explicit realtimeInputConfig.automaticActivityDetection
         // (silenceDurationMs/prefixPaddingMs) was added here as a Bug 1 mitigation, but
         // the very first live session on the revision that shipped it hit a fatal
