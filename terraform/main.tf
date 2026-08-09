@@ -55,7 +55,10 @@ variable "timezone" {
 variable "max_global_concurrent_sessions" {
   description = "Fleet-wide cap on concurrent WebSocket/Gemini sessions across all Cloud Run instances"
   type        = string
-  default     = "250"
+  # Raised from 250: the Firestore sharded counter behind this is deliberately
+  # approximate, so a cap only 25% above a 200-user target would start
+  # rejecting real users before 200 was actually reached.
+  default     = "400"
 }
 
 variable "billing_account_id" {
@@ -151,25 +154,32 @@ resource "google_cloud_run_v2_service" "argus" {
 
       resources {
         limits = {
-          cpu    = "1"
-          memory = "1Gi"
+          cpu    = "2"
+          memory = "2Gi"
         }
       }
     }
 
-    # Explicit concurrency (was left at Cloud Run's implicit default of 80,
-    # which a local relay-load test showed getting close to 512Mi's ceiling
-    # on relay overhead alone, before the real @google/genai SDK's own
-    # per-connection upstream-session overhead is even added). 40 * 15
-    # max-instances = 600 slots, comfortably over the 200-concurrent-user
-    # target with headroom for uneven distribution across instances (session
-    # affinity means reconnects stick to one instance, so load isn't always
-    # balanced evenly).
-    max_instance_request_concurrency = 40
+    # Sizing revisited 2026-08-09: the binding constraint here is CPU, not
+    # memory. Each session JSON-parses a ~43KB base64 audio chunk every second
+    # plus a ~150KB base64 JPEG every 2s, and re-serialises both to the Gemini
+    # SDK, so per-instance concurrency is really "how many simultaneous
+    # transcode+relay streams fit on one vCPU". The earlier relay-load test
+    # measured only ~0.7-0.9MB RSS per connection, which is why the previous
+    # 1cpu/1Gi/40-concurrency shape looked comfortable on memory while being
+    # tight on CPU. Now 2 vCPU for 25 concurrent streams, and 20 * 25 = 500
+    # slots against the 200-concurrent-user target — headroom matters because
+    # session affinity sticks reconnects to one instance, so load is not
+    # evenly distributed.
+    max_instance_request_concurrency = 25
 
     scaling {
-      min_instance_count = 0
-      max_instance_count = 15
+      # Logs showed a cold start on essentially every session at low traffic
+      # ("Starting new instance. Reason: AUTOSCALING" 2-3s before most
+      # connects), adding ~700ms-1s to connection open. One warm instance
+      # removes that for the common case.
+      min_instance_count = 1
+      max_instance_count = 20
     }
 
     session_affinity = true

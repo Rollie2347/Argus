@@ -65,7 +65,13 @@ function httpRateLimit(windowMs, max) {
 const app = express();
 const server = createServer(app);
 
-app.use("/api", httpRateLimit(60_000, 60));
+// Per-IP HTTP limit. Same CGNAT reasoning as WS_MAX_CONN_PER_IP: every new
+// install calls POST /api/user/:id/claim once, so a few hundred users sharing
+// a carrier egress IP can legitimately produce a few hundred requests in a
+// short window. 60/min would have turned that into failed claims — which is
+// exactly the failure mode behind known issue #24 (a device stranded without
+// a device secret because its one claim attempt failed).
+app.use("/api", httpRateLimit(60_000, parseInt(process.env.HTTP_RATE_LIMIT_PER_MIN) || 300));
 
 app.get("/api/health", (req, res) => {
   const tools = TOOLS[0].functionDeclarations.map(f => f.name);
@@ -134,11 +140,20 @@ app.use(express.static(frontendPath, { index: false }));
 // arriving before per-message validation below ever runs.
 const wss = new WebSocketServer({ server, path: "/ws", maxPayload: 4 * 1024 * 1024 });
 
-const WS_MAX_CONN_PER_IP = 5;
+// Per-IP cap. This was 5, which is fine for one household but actively breaks
+// at real user counts: mobile carriers put large numbers of subscribers behind
+// a handful of CGNAT addresses, and campus/office WiFi does the same, so a
+// low per-IP cap rejects legitimate users who simply share an egress IP. It is
+// a blunt anti-abuse guard, not a spend cap — MAX_GLOBAL_CONCURRENT_SESSIONS
+// below is what actually bounds cost, so this can be generous.
+const WS_MAX_CONN_PER_IP = parseInt(process.env.WS_MAX_CONN_PER_IP) || 50;
 // Fleet-wide budget so organic growth (or abuse) past this fails safe with a
 // clear rejection instead of silently becoming an uncapped Gemini bill —
 // connectionsByIp above only bounds a single IP, not total concurrent spend.
-const MAX_GLOBAL_CONCURRENT_SESSIONS = parseInt(process.env.MAX_GLOBAL_CONCURRENT_SESSIONS) || 250;
+// Default raised 250 -> 400: the sharded counter is deliberately approximate
+// (see reserveGlobalSlot), so a cap only 25% above a 200-user target would
+// start rejecting real users before the target was actually reached.
+const MAX_GLOBAL_CONCURRENT_SESSIONS = parseInt(process.env.MAX_GLOBAL_CONCURRENT_SESSIONS) || 400;
 const WS_MSG_RATE_LIMIT = 30; // messages/sec/connection
 const ALLOWED_WS_TYPES = new Set(["audio", "image", "user_id", "greet"]);
 const MAX_AUDIO_B64_LEN = 200_000; // ~150KB raw — generous for a 1s 16kHz/16-bit mono chunk
@@ -328,6 +343,17 @@ wss.on("connection", async (clientWs, req) => {
   // start responding, separate from connection-open latency.
   let lastAudioForwardedAt = 0;
   let responseInFlight = false;
+  // Turn-shape instrumentation. The existing "turn latency" number is measured
+  // from the last forwarded audio chunk, and the client sends a chunk every
+  // ~1s whether or not anyone is speaking — so that metric is structurally
+  // incapable of exceeding ~1s and cannot explain a long silent gap. These
+  // track how long Argus actually spoke for and how long it stayed quiet
+  // between turns, which is what distinguishes "rambled for 36s" from "said
+  // nothing for 36s".
+  let turnStartedAt = 0;
+  let turnAudioChunks = 0;
+  let lastTurnEndedAt = 0;
+  let userSpeechOpen = false;
 
   try {
     // Build dynamic system instruction with live memory, weather + location context
@@ -343,6 +369,14 @@ wss.on("connection", async (clientWs, req) => {
         // there is no text at all to caption — closed captions had nothing
         // to display regardless of the mobile-side toggle.
         outputAudioTranscription: {},
+        // Diagnostic (added 2026-08-09 to chase a reported 36s mid-session
+        // pause): without this there is no server-side signal for when the
+        // USER spoke, so a silent gap is indistinguishable from Argus giving
+        // a very long answer. Only the *timing* is logged by default; the
+        // transcript text is logged only when LOG_TRANSCRIPT_TEXT=1, since
+        // the App Store disclosure states Argus does not store speech and
+        // Cloud Run logs are retained.
+        inputAudioTranscription: {},
         // Without this, sessions that stream both audio AND video (Argus
         // sends camera frames alongside mic audio in the same session) are
         // hard-capped at 2 minutes per Gemini's Live API docs and silently
@@ -387,8 +421,25 @@ wss.on("connection", async (clientWs, req) => {
             const isResponseActivity = !!(msg.toolCall || msg.data || (msg.serverContent && msg.serverContent.outputTranscription && msg.serverContent.outputTranscription.text));
             if (isResponseActivity && !responseInFlight) {
               responseInFlight = true;
+              turnStartedAt = Date.now();
+              turnAudioChunks = 0;
+              const quietMs = lastTurnEndedAt ? Date.now() - lastTurnEndedAt : 0;
+              console.log(`🗣️ Response turn started${lastTurnEndedAt ? ` — ${quietMs}ms quiet since last turn ended` : ""}`);
               if (lastAudioForwardedAt) {
                 console.log(`⏱️ Turn latency: ${Date.now() - lastAudioForwardedAt}ms`);
+              }
+            }
+            if (msg.data) turnAudioChunks++;
+
+            // When the user's own speech starts/stops, per inputAudioTranscription.
+            // A long gap with NO user-speech events means dead air on the mic
+            // side; a long gap full of them means Gemini heard speech and chose
+            // not to respond — completely different bugs.
+            const inTr = msg.serverContent && msg.serverContent.inputTranscription;
+            if (inTr && inTr.text) {
+              if (!userSpeechOpen) { userSpeechOpen = true; console.log("🎙️ User speech detected"); }
+              if (process.env.LOG_TRANSCRIPT_TEXT === "1") {
+                console.log(`   user said: ${String(inTr.text).slice(0, 80)}`);
               }
             }
 
@@ -464,7 +515,17 @@ wss.on("connection", async (clientWs, req) => {
                 transcriptBuffer = "";
               }
               clientWs.send(JSON.stringify({ type: "turn_complete" }));
+              // Duration + chunk count make a long pause self-explaining: a
+              // 36s turn with hundreds of chunks is Argus talking too long; a
+              // 36s quiet gap before the next turn is Argus not responding.
+              if (turnStartedAt) {
+                const spokenMs = Date.now() - turnStartedAt;
+                console.log(`🔇 Turn complete — ${turnAudioChunks} audio chunks over ${spokenMs}ms`);
+              }
+              lastTurnEndedAt = Date.now();
+              turnStartedAt = 0;
               responseInFlight = false;
+              userSpeechOpen = false;
             }
           } catch (err) {
             console.error("Error processing Gemini message:", err.message);

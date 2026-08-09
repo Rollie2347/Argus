@@ -9,7 +9,16 @@ WS_SHARED_SECRET="${2:-$WS_SHARED_SECRET}"
 WEATHER_LAT="${3:-${WEATHER_LAT:-41.88}}"
 WEATHER_LON="${4:-${WEATHER_LON:--87.63}}"
 TIMEZONE="${5:-${TIMEZONE:-America/Chicago}}"
-MAX_GLOBAL_CONCURRENT_SESSIONS="${6:-${MAX_GLOBAL_CONCURRENT_SESSIONS:-250}}"
+MAX_GLOBAL_CONCURRENT_SESSIONS="${6:-${MAX_GLOBAL_CONCURRENT_SESSIONS:-400}}"
+# Sizing note (2026-08-09): the binding constraint for this service is CPU, not
+# memory. Every session JSON-parses a ~43KB base64 audio chunk each second plus
+# a ~150KB base64 JPEG every 2s, and re-serialises both to the Gemini SDK — so
+# per-instance concurrency is really "how many concurrent transcode+relay
+# streams fit on one vCPU". Measured RSS was only ~0.7-0.9MB/connection, which
+# is why the old 1Gi/1cpu/40-concurrency shape looked fine on memory while
+# being tight on CPU. 20 instances x 25 = 500 concurrent slots against a
+# 200-user target. min-instances 1 removes the cold start that logs showed on
+# essentially every session.
 if [ -z "$GEMINI_API_KEY" ] || [ -z "$WS_SHARED_SECRET" ]; then
   echo "Usage: ./deploy-cloudrun.sh <GEMINI_API_KEY> <WS_SHARED_SECRET> [WEATHER_LAT] [WEATHER_LON] [TIMEZONE] [MAX_GLOBAL_CONCURRENT_SESSIONS]"
   echo "Generate a shared secret with: node -e \"console.log(require('crypto').randomBytes(32).toString('hex'))\""
@@ -38,11 +47,11 @@ gcloud run deploy $SERVICE_NAME \
   --allow-unauthenticated \
   --set-env-vars "GEMINI_API_KEY=$GEMINI_API_KEY,WS_SHARED_SECRET=$WS_SHARED_SECRET,GCP_PROJECT_ID=$PROJECT_ID,WEATHER_LAT=$WEATHER_LAT,WEATHER_LON=$WEATHER_LON,TIMEZONE=$TIMEZONE,MAX_GLOBAL_CONCURRENT_SESSIONS=$MAX_GLOBAL_CONCURRENT_SESSIONS" \
   --port 8080 \
-  --memory 1Gi \
-  --cpu 1 \
-  --min-instances 0 \
-  --max-instances 15 \
-  --concurrency 40 \
+  --memory 2Gi \
+  --cpu 2 \
+  --min-instances 1 \
+  --max-instances 20 \
+  --concurrency 25 \
   --timeout 3600 \
   --session-affinity
 URL=$(gcloud run services describe $SERVICE_NAME --region $REGION --format="value(status.url)")
