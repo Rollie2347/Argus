@@ -129,6 +129,17 @@ export default function Home() {
   const soundRef = useRef<Audio.Sound | null>(null);
   const toolStatusTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const connectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Incremented on every connect and every disconnect. Anything still in
+  // flight from an older session (a socket whose close event hasn't landed
+  // yet, a queued audio burst, a running capture loop) compares against this
+  // and bails out, so a superseded session can't tear down the live one.
+  const epochRef = useRef(0);
+  // startAudioLoop reads `muted` from the closure it was created in, which
+  // never updates for the life of the loop — mirror it in a ref so toggling
+  // the mic switch actually takes effect mid-session.
+  const mutedRef = useRef(false);
+  const audioStartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const playbackTokenRef = useRef(0);
 
   function addLine(text: string, role: Line["role"]) {
     setLines(prev => [...prev.slice(-20), { text, role }]);
@@ -140,14 +151,38 @@ export default function Home() {
   }
 
   function handleMsg(msg: any) {
+    // Messages from a superseded socket are discarded. Without this, a stale
+    // socket's delayed close event reached the branches below and reverted a
+    // live session to the dormant screen (camera unmounting mid-conversation),
+    // and its leftover audio played on top of the current session's audio.
+    if (msg.epoch !== undefined && msg.epoch !== epochRef.current) return;
     lastActivityRef.current = Date.now();
     if (msg.type === "connected") { clearConnectTimeout(); setStatus("observing"); }
     else if (msg.type === "text") { addLine(msg.data, "argus"); setStatus("observing"); clearToolStatus(); }
     else if (msg.type === "tool_event") showToolStatus(TOOL_LABELS[msg.tool] || msg.tool);
     else if (msg.type === "audio") { setStatus("speaking"); enqueueAudio(msg.data); }
     else if (msg.type === "turn_complete") { setStatus("observing"); clearToolStatus(); }
-    else if (msg.type === "disconnected") { clearConnectTimeout(); setStatus("dormant"); socketRef.current = null; stopAudio(); stopFrameLoop(); stopPlayback(); clearToolStatus(); }
+    else if (msg.type === "disconnected") {
+      // Reaching here means the backend genuinely dropped the connection —
+      // a user-initiated teardown goes through disconnect() and never emits
+      // this. Say so instead of silently falling back to the dormant screen.
+      const dropped = socketRef.current;
+      teardownSession();
+      dropped?.disconnect();
+      setStatus("dormant");
+      pushError(msg.code === 4029 ? "Argus is at capacity — try again shortly" : "Connection dropped — tap ◉ to reconnect");
+    }
     else if (msg.type === "error") { clearConnectTimeout(); pushError(msg.data); setStatus("error"); }
+  }
+
+  // Everything needed to stop a session's background work, without touching
+  // status or the socket itself.
+  function teardownSession() {
+    clearConnectTimeout();
+    if (audioStartTimerRef.current) { clearTimeout(audioStartTimerRef.current); audioStartTimerRef.current = null; }
+    epochRef.current++;
+    socketRef.current = null;
+    stopAudio(); stopFrameLoop(); stopPlayback(); clearToolStatus();
   }
 
   // Tool status (e.g. "Looking at what's around you") is shown as a transient
@@ -171,13 +206,31 @@ export default function Home() {
 
   function toggleMute(micOn: boolean) {
     setMuted(!micOn);
+    mutedRef.current = !micOn;
   }
 
   async function startAudioLoop() {
-    await Audio.setAudioModeAsync({ allowsRecordingIOS: true, playsInSilentModeIOS: true });
+    // loopRef is set BEFORE the fallible audio-session call. Previously this
+    // ran after it, so a rejection here left the loop permanently un-started
+    // with no error anywhere — the camera kept streaming frames while the mic
+    // sent nothing for the entire session. Cloud Run logs showed this in 6 of
+    // 21 sessions, including 103s/60s/51s ones with zero audio chunks.
     loopRef.current = true;
-    while (loopRef.current && socketRef.current?.ready) {
-      if (!muted) {
+    const myEpoch = epochRef.current;
+    // Configuring the session for recording can lose a race against playback
+    // starting up (the greet reply arrives ~1.2s in, right as this runs at
+    // ~1.5s) — retry rather than giving up on the microphone for good.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await Audio.setAudioModeAsync({ allowsRecordingIOS: true, playsInSilentModeIOS: true });
+        break;
+      } catch (e) {
+        if (attempt === 2) throw e;
+        await new Promise(r => setTimeout(r, 400));
+      }
+    }
+    while (loopRef.current && epochRef.current === myEpoch && socketRef.current?.ready) {
+      if (!mutedRef.current) {
         const rec = new Audio.Recording();
         try {
           await rec.prepareToRecordAsync({ android: { extension: ".wav", outputFormat: Audio.AndroidOutputFormat.DEFAULT, audioEncoder: Audio.AndroidAudioEncoder.DEFAULT, sampleRate: 16000, numberOfChannels: 1, bitRate: 128000 }, ios: { extension: ".wav", audioQuality: Audio.IOSAudioQuality.LOW, sampleRate: 16000, numberOfChannels: 1, bitRate: 128000, linearPCMBitDepth: 16, linearPCMIsBigEndian: false, linearPCMIsFloat: false }, web: {} });
@@ -191,10 +244,22 @@ export default function Home() {
           // round trip — that wait was the dominant chunk of dead-air in
           // each ~1s cycle and was audible as cutting in and out.
           if (uri) {
-            const sock = socketRef.current;
-            getAudioB64(uri).then(b64 => { if (sock?.ready) sock.sendAudio(b64); }).catch(() => {});
+            // Re-read the current socket at send time rather than sending to a
+            // captured one: a captured socket could still be OPEN after the app
+            // moved to a new session, delivering this chunk into the old Gemini
+            // session, whose reply then played over the live session's audio.
+            getAudioB64(uri).then(b64 => {
+              if (epochRef.current === myEpoch && socketRef.current?.ready) socketRef.current.sendAudio(b64);
+            }).catch(() => {});
           }
-        } catch (e) { try { await rec.stopAndUnloadAsync(); } catch {} }
+        } catch (e) {
+          try { await rec.stopAndUnloadAsync(); } catch {}
+          // Both prepareToRecordAsync and stopAndUnloadAsync throw
+          // synchronously, so a repeating failure would spin this loop on
+          // microtasks alone and never yield — starving timers, the frame
+          // loop and rendering. This forces a real macrotask yield.
+          await new Promise(r => setTimeout(r, 250));
+        }
       } else { await new Promise(r => setTimeout(r, 200)); }
     }
   }
@@ -203,7 +268,9 @@ export default function Home() {
 
   function startFrameLoop() {
     stopFrameLoop();
+    const myEpoch = epochRef.current;
     frameIntervalRef.current = setInterval(async () => {
+      if (epochRef.current !== myEpoch) { stopFrameLoop(); return; }
       if (!cameraRef.current || !socketRef.current?.ready) return;
       try {
         // takePictureAsync defaults shutterSound to true — with a real photo
@@ -234,6 +301,7 @@ export default function Home() {
     const chunks = audioQueueRef.current;
     audioQueueRef.current = [];
     isPlayingRef.current = true;
+    const myToken = playbackTokenRef.current;
     const pcmBytes = chunks.reduce((sum, b64) => sum + atob(b64).length, 0);
     const expectedMs = (pcmBytes / (24000 * 2)) * 1000; // 24kHz, 16-bit mono
     let settled = false;
@@ -248,12 +316,22 @@ export default function Home() {
       if (settled) return;
       settled = true;
       if (watchdog) clearTimeout(watchdog);
+      // A superseded burst must not resurrect the queue stopPlayback() just
+      // cleared, or reset a flag a newer burst now owns.
+      if (playbackTokenRef.current !== myToken) return;
       isPlayingRef.current = false;
       playNextInQueue();
     };
     try {
       const wavB64 = pcmChunksToWavBase64(chunks, 24000);
-      const { sound } = await Audio.Sound.createAsync({ uri: `data:audio/wav;base64,${wavB64}` }, { shouldPlay: true });
+      // Created paused, then started only if this burst is still current.
+      // With shouldPlay:true, a stopPlayback() landing during this await left
+      // an already-playing sound that nothing tracked (soundRef had been
+      // cleared) while isPlayingRef was reset to false — so the next burst
+      // started a second sound on top of it. That was Argus talking over
+      // itself, and neither sound could be stopped.
+      const { sound } = await Audio.Sound.createAsync({ uri: `data:audio/wav;base64,${wavB64}` }, { shouldPlay: false });
+      if (playbackTokenRef.current !== myToken) { try { await sound.unloadAsync(); } catch {} return; }
       soundRef.current = sound;
       watchdog = setTimeout(() => {
         try { sound.unloadAsync(); } catch {}
@@ -263,18 +341,27 @@ export default function Home() {
         if (!st.isLoaded) { finishPlayback(); return; }
         if (st.didJustFinish) { sound.unloadAsync(); finishPlayback(); }
       });
+      await sound.playAsync();
     } catch (e) {
       finishPlayback();
     }
   }
 
   function stopPlayback() {
+    // Invalidates any burst currently mid-load so it unloads itself instead of
+    // starting playback after this call.
+    playbackTokenRef.current++;
     audioQueueRef.current = [];
     isPlayingRef.current = false;
     if (soundRef.current) { try { soundRef.current.unloadAsync(); } catch {} soundRef.current = null; }
   }
 
-  useEffect(() => { getStoredUser().then(u => { if (!u) router.replace("/sign-in"); else setUser(u); }); Audio.requestPermissionsAsync(); }, []);
+  useEffect(() => {
+    getStoredUser().then(u => { if (!u) router.replace("/sign-in"); else setUser(u); });
+    // Leaving the screen must stop the capture loops and playback — otherwise
+    // they keep running against a socket nothing owns any more.
+    return () => { const sock = socketRef.current; teardownSession(); sock?.disconnect(); };
+  }, []);
 
   useEffect(() => {
     if (status !== "observing") { setThinkingHint(null); return; }
@@ -290,17 +377,33 @@ export default function Home() {
   async function connect() {
     if (!user) return;
     if (!camPerm?.granted) await requestCam();
+    // Make sure the microphone is actually granted before a session starts —
+    // this used to be fired once on mount with its result ignored.
+    const mic = await Audio.requestPermissionsAsync();
+    if (!mic.granted) { pushError("Microphone access is off — enable it in Settings"); setStatus("error"); return; }
     setStatus("connecting");
-    const sock = new ArgusSocket(handleMsg, user.id, user.name);
+    const myEpoch = ++epochRef.current;
+    mutedRef.current = muted;
+    const sock = new ArgusSocket(handleMsg, user.id, user.name, myEpoch);
     socketRef.current = sock;
     sock.connect();
-    setTimeout(() => { startAudioLoop(); startFrameLoop(); }, 1500);
+    audioStartTimerRef.current = setTimeout(() => {
+      if (epochRef.current !== myEpoch) return;
+      // startAudioLoop is async and was previously called with no .catch() —
+      // a rejection was an unobserved promise, silently costing the whole
+      // session's microphone with nothing shown to the user.
+      startAudioLoop().catch(err => {
+        console.warn("[argus] audio loop failed to start:", err?.message ?? err);
+        pushError("Microphone unavailable — tap ✕ and reconnect");
+      });
+      startFrameLoop();
+    }, 1500);
     // Belt-and-suspenders: ArgusSocket's onerror/onclose usually fire on a bad
     // connection, but a silently stalled OS-level socket attempt (bad network,
     // blocked egress) could otherwise leave the UI on "Connecting" indefinitely.
     clearConnectTimeout();
     connectTimeoutRef.current = setTimeout(() => {
-      if (socketRef.current === sock) {
+      if (epochRef.current === myEpoch) {
         disconnect();
         pushError("Couldn't reach Argus — check your connection and try again");
         setStatus("error");
@@ -308,7 +411,12 @@ export default function Home() {
     }, CONNECT_TIMEOUT_MS);
   }
 
-  function disconnect() { clearConnectTimeout(); stopAudio(); stopFrameLoop(); stopPlayback(); socketRef.current?.disconnect(); socketRef.current = null; setStatus("dormant"); }
+  function disconnect() {
+    const sock = socketRef.current;
+    teardownSession();
+    sock?.disconnect();
+    setStatus("dormant");
+  }
 
   function flipCamera() { setFacing(f => (f === "back" ? "front" : "back")); }
 

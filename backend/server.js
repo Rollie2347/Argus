@@ -144,6 +144,13 @@ const ALLOWED_WS_TYPES = new Set(["audio", "image", "user_id", "greet"]);
 const MAX_AUDIO_B64_LEN = 200_000; // ~150KB raw — generous for a 1s 16kHz/16-bit mono chunk
 const MAX_IMAGE_B64_LEN = 3_000_000; // ~2.2MB raw — generous for a quality:0.5 JPEG frame
 const connectionsByIp = new Map();
+// One live session per user. Nothing previously stopped a single userId from
+// holding several concurrent Gemini sessions — a client that reconnected
+// before its old socket finished closing left the old session alive and
+// answering, so two sessions streamed audio back at once. This is the
+// server-side backstop for that; the client also guards it (see the epoch
+// check in mobile/app/(main)/home.tsx).
+const sessionsByUser = new Map();
 
 // Per-IP geolocation cache (mirrors weather.js's location cache). The
 // ipapi.co lookup below was measured adding ~150-500ms to every single
@@ -298,6 +305,18 @@ wss.on("connection", async (clientWs, req) => {
   let userId = auth.id;
   console.log("👤 User:", userId);
 
+  // Supersede any still-open session for this user before opening a new one.
+  const sessionKey = auth.id;
+  const priorWs = sessionsByUser.get(sessionKey);
+  if (priorWs && priorWs !== clientWs) {
+    console.log("♻️ Superseding prior session for", sessionKey);
+    try { priorWs.close(4002, "superseded by a newer session"); } catch (_) {}
+  }
+  sessionsByUser.set(sessionKey, clientWs);
+  clientWs.on("close", () => {
+    if (sessionsByUser.get(sessionKey) === clientWs) sessionsByUser.delete(sessionKey);
+  });
+
   const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
   let session = null;
   let audioChunks = 0;
@@ -421,11 +440,14 @@ wss.on("connection", async (clientWs, req) => {
               clientWs.send(JSON.stringify({ type: "audio", data: audioB64 }));
             }
 
-            // Handle text response (TEXT-modality only — unused today, kept
-            // for compatibility if responseModalities ever changes)
-            if (msg.text) {
-              clientWs.send(JSON.stringify({ type: "text", data: msg.text }));
-            }
+            // NOTE: do not touch msg.text here. This session is AUDIO-only
+            // (responseModalities: [Modality.AUDIO]), so the SDK's .text
+            // getter can never return anything useful — but reading it
+            // concatenates every part and emits a "there are non-text parts
+            // inlineData..." warning on every single audio chunk. That was
+            // 3,232 of 4,000 log lines (81%) plus per-chunk string work on
+            // the hot relay path. Captions come from outputTranscription
+            // below instead.
 
             // Buffer the spoken-audio transcript as it streams in, then flush
             // it as one caption line when the turn completes — matches how
