@@ -71,12 +71,40 @@ export async function updateUserMemory(userId = "default", data) {
 const MAX_PREFERENCE_ENTRIES = 20;
 const MAX_PREFERENCE_CHARS = 1500;
 
+// Every preference in production is stored under a *dotted top-level key*
+// (`preferences.child_name`) rather than inside a nested `preferences` map —
+// the artifact of known issue #16's pre-2026-07-16 bug, where a
+// `set({"preferences.x": v}, {merge:true})` wrote a literal dotted field name
+// instead of nesting. #16 fixed new writes but never migrated the data that
+// already existed, so `doc.preferences` is `undefined` on every real account
+// and all 10 facts stored across the two long-lived accounts (verified
+// 2026-08-09 against live Firestore) are unreachable — recall_memory returns
+// an empty map and Argus genuinely cannot remember them.
+//
+// Reading is normalised here rather than by a one-shot migration script so it
+// self-heals for every account, including any that predate a script run.
+// upsertPreference additionally deletes the dotted twin when it rewrites a
+// key, so the legacy shape drains away as accounts are used.
+export function collectPreferences(doc) {
+  if (!doc) return {};
+  const merged = { ...(doc.preferences || {}) };
+  for (const [k, v] of Object.entries(doc)) {
+    if (!k.startsWith("preferences.")) continue;
+    const key = k.slice("preferences.".length);
+    if (!key || key in merged) continue; // nested form wins — it's the current shape
+    merged[key] = v;
+  }
+  return merged;
+}
+
 export function boundPreferences(preferences) {
   if (!preferences) return {};
   const entries = Object.entries(preferences)
     .map(([key, entry]) => {
       const value = entry && typeof entry === "object" ? entry.value : entry;
-      const updatedAt = (entry && typeof entry === "object" && entry.updatedAt) || "";
+      // Coerced: legacy entries are bare strings (no updatedAt at all), and a
+      // stray non-string here would make the localeCompare below throw.
+      const updatedAt = String((entry && typeof entry === "object" && entry.updatedAt) || "");
       return [key, value, updatedAt];
     })
     .sort((a, b) => b[2].localeCompare(a[2]))
@@ -108,7 +136,11 @@ export async function upsertPreference(userId, key, value) {
   const ref = db.collection("users").doc(userId);
   await db.runTransaction(async (tx) => {
     const doc = await tx.get(ref);
-    const current = doc.exists ? doc.data().preferences || {} : {};
+    const data = doc.exists ? doc.data() : {};
+    // Dedup/merge against the legacy dotted keys too, not just the nested map
+    // — otherwise re-stating a fact that only exists in the legacy shape adds
+    // a second copy under the new shape instead of updating the old one.
+    const current = collectPreferences(data);
     const now = new Date().toISOString();
     const existingKey = Object.keys(current).find((k) => {
       const v = current[k];
@@ -116,7 +148,70 @@ export async function upsertPreference(userId, key, value) {
       return String(existingValue).toLowerCase() === String(value).toLowerCase();
     });
     const targetKey = existingKey || key;
-    tx.set(ref, { preferences: { ...current, [targetKey]: { value, updatedAt: now } } }, { merge: true });
+    const update = {
+      preferences: { ...current, [targetKey]: { value, updatedAt: now } },
+    };
+    // Retire the dotted twin so the legacy shape drains as accounts are used.
+    // The key is passed raw, NOT backtick-escaped: DocumentMask.fromObject
+    // builds `new FieldPath(key)` as a single literal segment and does not
+    // split on dots (verified in the SDK source — it's the same behaviour that
+    // caused #16 in the first place), so this targets the literal field and
+    // the SDK handles mask escaping itself.
+    if (`preferences.${targetKey}` in data) {
+      update[`preferences.${targetKey}`] = FieldValue.delete();
+    }
+    tx.set(ref, update, { merge: true });
+  });
+}
+
+// Removes one freeform preference. Without this, remember_preference is
+// append-only and a fact stored wrongly can never be corrected — see
+// forget_memory in agents.js.
+export async function removePreference(userId, key) {
+  if (!db) return false;
+  const ref = db.collection("users").doc(userId);
+  return db.runTransaction(async (tx) => {
+    const doc = await tx.get(ref);
+    if (!doc.exists) return false;
+    const data = doc.data();
+    const current = collectPreferences(data);
+    // Match on key first, then on value, so the model can say "forget that I
+    // like anchovies" without knowing the key it was filed under.
+    const target =
+      key in current
+        ? key
+        : Object.keys(current).find((k) => {
+            const v = current[k];
+            const val = v && typeof v === "object" ? v.value : v;
+            return String(val).toLowerCase() === String(key).toLowerCase();
+          });
+    if (!target) return false;
+    const next = { ...current };
+    delete next[target];
+    const update = { preferences: next };
+    if (`preferences.${target}` in data) {
+      update[`preferences.${target}`] = FieldValue.delete(); // raw key — see upsertPreference
+    }
+    tx.set(ref, update, { merge: true });
+    return true;
+  });
+}
+
+// Removes one entry from a list-valued field (dietaryPreferences/allergies).
+// appendUserListField dedups but only ever grows, so before this there was no
+// way to correct a wrongly-recorded allergy short of deleting the account —
+// and a phantom allergy silently degrades every recipe suggestion.
+export async function removeUserListField(userId, field, value) {
+  if (!db) return false;
+  const ref = db.collection("users").doc(userId);
+  return db.runTransaction(async (tx) => {
+    const doc = await tx.get(ref);
+    if (!doc.exists) return false;
+    const list = asList(doc.data()[field]);
+    const next = list.filter((v) => String(v).toLowerCase() !== String(value).toLowerCase());
+    if (next.length === list.length) return false;
+    tx.set(ref, { [field]: next }, { merge: true });
+    return true;
   });
 }
 
@@ -125,6 +220,13 @@ export async function upsertPreference(userId, key, value) {
 // user's second distinct allergy mention silently erased the first — a real
 // safety bug for a tool whose whole point is recipe-safety personalization.
 // Dedups case-insensitively so re-stating the same fact doesn't grow the list.
+// Capped because dietaryPreferences/allergies are the ONE remaining input to
+// the always-injected system instruction that grows with usage. Dedup alone
+// doesn't bound it — a model that files "no peanuts", "peanut allergy" and
+// "avoid peanuts" as three distinct strings grows the list forever. Oldest
+// entries are dropped first; 25 is far above any real dietary profile.
+const MAX_LIST_FIELD_ENTRIES = 25;
+
 export async function appendUserListField(userId, field, value) {
   if (!db) return;
   const ref = db.collection("users").doc(userId);
@@ -133,7 +235,7 @@ export async function appendUserListField(userId, field, value) {
     const current = doc.exists ? doc.data()[field] || [] : [];
     const list = Array.isArray(current) ? current : [current];
     if (list.some((v) => String(v).toLowerCase() === String(value).toLowerCase())) return;
-    tx.set(ref, { [field]: [...list, value] }, { merge: true });
+    tx.set(ref, { [field]: [...list, value].slice(-MAX_LIST_FIELD_ENTRIES) }, { merge: true });
   });
 }
 
@@ -146,30 +248,37 @@ function asList(value) {
 // DAILY LOG — What happened today
 // ============================================================
 
+// A day's entries live in ONE document, and arrayUnion can only ever grow it —
+// there is no cap in Firestore for that. A heavy day of log_daily_activity
+// calls therefore walks the doc toward the hard 1MB document limit, at which
+// point every further write for that day fails. This doc is also read on every
+// single WebSocket connect (buildMemoryContext), so its size is on the
+// connection-open latency path. Trimming to the most recent N inside a
+// transaction bounds both, and replaces arrayUnion's read-free append with an
+// isolated read-modify-write (arrayUnion was atomic but uncapped; a plain
+// read-then-write would have been capped but racy — the transaction is both).
+const MAX_DAILY_ENTRIES = 50;
+
 export async function addDailyEntry(userId = "default", entry) {
   if (!db) return;
   const today = new Date().toISOString().split("T")[0];
+  const ref = db.collection("users").doc(userId).collection("daily").doc(today);
   try {
-    await db
-      .collection("users")
-      .doc(userId)
-      .collection("daily")
-      .doc(today)
-      .set(
-        {
-          entries: FieldValue.arrayUnion({
-            ...entry,
-            timestamp: new Date().toISOString(),
-          }),
-        },
-        { merge: true }
-      );
+    await db.runTransaction(async (tx) => {
+      const doc = await tx.get(ref);
+      const current = doc.exists ? doc.data().entries || [] : [];
+      const next = [...current, { ...entry, timestamp: new Date().toISOString() }];
+      tx.set(ref, { entries: next.slice(-MAX_DAILY_ENTRIES) }, { merge: true });
+    });
   } catch (err) {
     console.error("Daily log error:", err.message);
   }
 }
 
-export async function getDailyLog(userId = "default", date = null) {
+// `limit` caps how many entries come back (most recent first-in-order). Every
+// caller feeds this either into the system instruction or into a tool response
+// that goes straight to Gemini, so an unbounded return is unbounded prompt.
+export async function getDailyLog(userId = "default", date = null, limit = MAX_DAILY_ENTRIES) {
   if (!db) return { entries: [] };
   const day = date || new Date().toISOString().split("T")[0];
   try {
@@ -179,7 +288,9 @@ export async function getDailyLog(userId = "default", date = null) {
       .collection("daily")
       .doc(day)
       .get();
-    return doc.exists ? doc.data() : { entries: [] };
+    if (!doc.exists) return { entries: [] };
+    const data = doc.data();
+    return { ...data, entries: (data.entries || []).slice(-limit) };
   } catch (err) {
     console.error("Daily read error:", err.message);
     return { entries: [] };
@@ -203,12 +314,35 @@ export async function getShoppingList(userId = "default") {
 export async function updateShoppingList(userId = "default", items) {
   if (!db) return;
   try {
-    await db.collection("users").doc(userId).collection("lists").doc("shopping").set({ 
-      items, 
-      updatedAt: new Date().toISOString() 
+    await db.collection("users").doc(userId).collection("lists").doc("shopping").set({
+      items,
+      updatedAt: new Date().toISOString()
     });
   } catch (err) {
     console.error("Shopping list error:", err.message);
+  }
+}
+
+// manage_shopping_list used to getShoppingList() then updateShoppingList() as
+// two separate round trips — the same read-then-write race that was closed for
+// preferences in 3200b3c but left open here. Two tool calls landing together
+// (Gemini can emit several in one toolCall message) would each compute a new
+// list from the same stale read, and the second write would silently drop the
+// first one's items. `mutate` receives the current list and returns the next.
+export async function mutateShoppingList(userId = "default", mutate) {
+  if (!db) return mutate([]);
+  const ref = db.collection("users").doc(userId).collection("lists").doc("shopping");
+  try {
+    return await db.runTransaction(async (tx) => {
+      const doc = await tx.get(ref);
+      const current = doc.exists ? doc.data().items || [] : [];
+      const next = mutate(current);
+      tx.set(ref, { items: next, updatedAt: new Date().toISOString() }, { merge: true });
+      return next;
+    });
+  } catch (err) {
+    console.error("Shopping list error:", err.message);
+    return null;
   }
 }
 
@@ -350,25 +484,36 @@ export async function deleteUserData(userId) {
 // had lived long enough to accumulate any). They're still fully available
 // on demand via the recall_memory tool; front-loading them was pure
 // duplication of a capability the model already had.
+// Hard ceiling on anything user-derived that reaches the system instruction.
+// Measured 2026-08-09 against live Firestore: the largest real account
+// contributes 22 characters, so this is headroom, not a squeeze — its job is
+// to guarantee the instruction can never grow with usage, which is the
+// property that was missing rather than a size problem that existed.
+const MAX_INJECTED_CHARS = 600;
+
+function clamp(str, max) {
+  return str.length <= max ? str : str.slice(0, max - 1) + "…";
+}
+
 export async function buildMemoryContext(userId = "default") {
   const [userMem, dailyLog] = await Promise.all([
     getUserMemory(userId),
-    getDailyLog(userId),
+    getDailyLog(userId, null, 5),
   ]);
 
   let context = "";
 
-  if (userMem.name) context += `User's name: ${userMem.name}. `;
+  if (userMem.name) context += `User's name: ${clamp(String(userMem.name), 80)}. `;
   const dietary = asList(userMem.dietaryPreferences);
-  if (dietary.length) context += `Dietary preferences: ${dietary.join(", ")}. `;
+  if (dietary.length) context += `Dietary preferences: ${clamp(dietary.join(", "), 200)}. `;
   const allergies = asList(userMem.allergies);
-  if (allergies.length) context += `Allergies: ${allergies.join(", ")}. `;
+  if (allergies.length) context += `Allergies: ${clamp(allergies.join(", "), 200)}. `;
 
-  // Today's activity — already bounded (per-day doc, only today's, last 5 entries)
+  // Today's activity — bounded at the read (last 5 entries of today's doc only)
   if (dailyLog.entries && dailyLog.entries.length > 0) {
-    const recent = dailyLog.entries.slice(-5);
-    context += `\n\nToday so far: ${recent.map((e) => e.summary || e.type).join("; ")}. `;
+    const summary = dailyLog.entries.map((e) => e.summary || e.type).join("; ");
+    context += `\n\nToday so far: ${clamp(summary, 400)}. `;
   }
 
-  return context;
+  return clamp(context, MAX_INJECTED_CHARS);
 }

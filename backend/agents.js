@@ -12,13 +12,16 @@ import {
   addDailyEntry,
   getDailyLog,
   getShoppingList,
-  updateShoppingList,
+  mutateShoppingList,
   addObservation,
   getRecentObservations,
   buildMemoryContext,
   boundPreferences,
+  collectPreferences,
   upsertPreference,
   appendUserListField,
+  removePreference,
+  removeUserListField,
 } from "./memory.js";
 import { getWeather, weatherToContext } from "./weather.js";
 
@@ -138,6 +141,18 @@ export const TOOLS = [
             value: { type: "STRING", description: "The value to store" }
           },
           required: ["category", "key", "value"]
+        }
+      },
+      {
+        name: "forget_memory",
+        description: "Remove something previously remembered about the user. Use when the user says a stored fact is wrong or out of date — for example 'I'm not allergic to shellfish anymore' or 'forget that I like anchovies'. Always use this instead of storing a contradicting preference.",
+        parameters: {
+          type: "OBJECT",
+          properties: {
+            category: { type: "STRING", enum: ["dietary", "allergy", "preference"] },
+            value: { type: "STRING", description: "The value or key to forget (e.g., 'shellfish', 'favorite_cuisine')" }
+          },
+          required: ["category", "value"]
         }
       },
       {
@@ -306,22 +321,21 @@ export async function handleToolCall(functionCall, userId) {
     }
 
     case "manage_shopping_list": {
-      let list = await getShoppingList(userId);
+      // Each mutation is a single transactional read-modify-write now — the
+      // old read-then-write pair let two tool calls in the same toolCall
+      // message compute from the same stale list and clobber each other.
       if (args.action === "add" && args.items) {
-        list = [...new Set([...list, ...args.items])];
-        await updateShoppingList(userId, list);
+        const list = await mutateShoppingList(userId, (cur) => [...new Set([...cur, ...args.items])]);
         return { list, added: args.items };
       } else if (args.action === "remove" && args.items) {
-        list = list.filter(i => !args.items.includes(i));
-        await updateShoppingList(userId, list);
+        const list = await mutateShoppingList(userId, (cur) => cur.filter(i => !args.items.includes(i)));
         return { list, removed: args.items };
       } else if (args.action === "check_off" && args.items) {
-        list = list.filter(i => !args.items.includes(i));
-        await updateShoppingList(userId, list);
+        const list = await mutateShoppingList(userId, (cur) => cur.filter(i => !args.items.includes(i)));
         await addDailyEntry(userId, { type: "shopping", summary: `Bought: ${args.items.join(", ")}` });
         return { list, checked_off: args.items };
       } else {
-        return { list };
+        return { list: await getShoppingList(userId) };
       }
     }
 
@@ -346,22 +360,29 @@ export async function handleToolCall(functionCall, userId) {
       // account-delete calls). The old "preferences"/"all" cases returned
       // getUserMemory(userId) / built on it directly, which leaked that
       // secret into a tool response the model could read or repeat back.
+      //
+      // collectPreferences (not mem.preferences) so the legacy dotted-key
+      // facts every real account actually stores are readable — before this,
+      // recall_memory returned an empty map for every production user.
+      // getDailyLog is capped: "today"/"all" previously returned the entire
+      // day's entries, an unbounded dump straight into the model's context —
+      // the same defect the system-instruction path had, just on demand.
       if (args.query_type === "preferences") {
         const mem = await getUserMemory(userId);
         return {
           name: mem.name || null,
           dietaryPreferences: mem.dietaryPreferences || [],
           allergies: mem.allergies || [],
-          preferences: boundPreferences(mem.preferences),
+          preferences: boundPreferences(collectPreferences(mem)),
         };
       }
-      if (args.query_type === "today") return await getDailyLog(userId);
+      if (args.query_type === "today") return await getDailyLog(userId, null, 20);
       if (args.query_type === "shopping_list") return { items: await getShoppingList(userId) };
       if (args.query_type === "recent_observations") return { observations: await getRecentObservations(userId, 10) };
       if (args.query_type === "all") {
         const [mem, dailyLog, shoppingList, recentObs] = await Promise.all([
           getUserMemory(userId),
-          getDailyLog(userId),
+          getDailyLog(userId, null, 20),
           getShoppingList(userId),
           getRecentObservations(userId, 10),
         ]);
@@ -369,13 +390,25 @@ export async function handleToolCall(functionCall, userId) {
           name: mem.name || null,
           dietaryPreferences: mem.dietaryPreferences || [],
           allergies: mem.allergies || [],
-          preferences: boundPreferences(mem.preferences),
+          preferences: boundPreferences(collectPreferences(mem)),
           today: dailyLog.entries || [],
           shopping_list: shoppingList,
           recent_observations: recentObs,
         };
       }
       return {};
+    }
+
+    case "forget_memory": {
+      // remember_preference is append-only (appendUserListField dedups but
+      // never removes), so before this a wrongly-recorded allergy was
+      // permanent short of deleting the whole account — and a phantom allergy
+      // silently degrades every recipe suggestion the app makes.
+      let removed = false;
+      if (args.category === "dietary") removed = await removeUserListField(userId, "dietaryPreferences", args.value);
+      else if (args.category === "allergy") removed = await removeUserListField(userId, "allergies", args.value);
+      else removed = await removePreference(userId, args.value);
+      return { forgotten: removed, category: args.category, value: args.value };
     }
 
     case "get_weather": {
@@ -522,6 +555,8 @@ You don't just respond — you NOTICE and SPEAK UP:
 ## RULES
 - Use your tools actively — store memories, log activities, check weather
 - When users mention personal details, ALWAYS use remember_preference to store them
+- When a user corrects or retracts something you remembered, use forget_memory — never store a contradicting value alongside the old one
+- Only name, dietary preferences and allergies are given to you up front; use recall_memory when you need anything else you've stored
 - Reference memory naturally ("last time you made this..." / "you mentioned you're allergic to...")
 - Keep voice responses SHORT (1-3 sentences)
 - Be grounded — if you can't see clearly, say so

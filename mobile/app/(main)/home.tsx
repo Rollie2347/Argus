@@ -12,7 +12,24 @@ type Status = "dormant"|"connecting"|"observing"|"speaking"|"error";
 type Line = { text: string; role: "argus"|"user"|"tool" };
 
 const CHUNK_MS = 1000;
+// Camera frames dominate the Gemini Live context window: video bills at 258
+// tokens/sec against 25 tokens/sec for audio, so at a flat 2s cadence a real
+// 115-second session measured 2026-08-09 spent 14,448 of its ~18,200 context
+// tokens (79%) on frames, versus 897 for the entire system instruction.
+// Context grows ~9,200 tokens/minute at that rate, and response quality and
+// latency degrade as it fills — this is what actually degrades over a long
+// conversation, not anything stored about the user.
+//
+// So: keep the responsive 2s cadence while a turn is actually in flight, and
+// back off while nothing is happening. Idle time is exactly when frames are
+// worth least — nobody is asking about what the camera sees — and it's most
+// of a typical session.
 const FRAME_MS = 2000;
+const FRAME_MS_IDLE = 5000;
+// How long after the last message from the server the conversation still
+// counts as active. One full turn (speak → respond) keeps traffic flowing well
+// inside this, so the cadence only drops during real lulls.
+const FRAME_IDLE_AFTER_MS = 6000;
 const AUDIO_GAIN = 1.6;
 const CONNECT_TIMEOUT_MS = 12000;
 
@@ -122,7 +139,7 @@ export default function Home() {
   const recordingRef = useRef<Audio.Recording|null>(null);
   const loopRef = useRef<boolean>(false);
   const cameraRef = useRef<CameraView>(null);
-  const frameIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const frameIntervalRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastActivityRef = useRef<number>(Date.now());
   const audioQueueRef = useRef<string[]>([]);
   const isPlayingRef = useRef(false);
@@ -266,24 +283,40 @@ export default function Home() {
 
   function stopAudio() { loopRef.current = false; try { recordingRef.current?.stopAndUnloadAsync(); } catch {} recordingRef.current = null; }
 
+  // Muted mic means the user cannot be mid-question, so treat it as idle
+  // regardless of recency.
+  function nextFrameDelay() {
+    if (mutedRef.current) return FRAME_MS_IDLE;
+    const sinceActivity = Date.now() - lastActivityRef.current;
+    return sinceActivity < FRAME_IDLE_AFTER_MS ? FRAME_MS : FRAME_MS_IDLE;
+  }
+
+  // Self-scheduling timeout rather than a fixed setInterval, so the cadence can
+  // change between ticks (see FRAME_MS_IDLE). It also means a slow
+  // takePictureAsync can't stack up overlapping captures the way a fixed
+  // interval could — the next tick is only scheduled once this one finishes.
   function startFrameLoop() {
     stopFrameLoop();
     const myEpoch = epochRef.current;
-    frameIntervalRef.current = setInterval(async () => {
+    const tick = async () => {
       if (epochRef.current !== myEpoch) { stopFrameLoop(); return; }
-      if (!cameraRef.current || !socketRef.current?.ready) return;
-      try {
-        // takePictureAsync defaults shutterSound to true — with a real photo
-        // capture firing every FRAME_MS for the whole session, that meant a
-        // shutter click on every single frame, continuously, for as long as
-        // the session stayed connected.
-        const photo = await cameraRef.current.takePictureAsync({ base64: true, quality: 0.5, skipProcessing: true, shutterSound: false });
-        if (photo?.base64 && socketRef.current?.ready) socketRef.current.sendImage(photo.base64);
-      } catch (e) { /* camera transiently busy — skip this tick */ }
-    }, FRAME_MS);
+      if (cameraRef.current && socketRef.current?.ready) {
+        try {
+          // takePictureAsync defaults shutterSound to true — with a real photo
+          // capture firing every FRAME_MS for the whole session, that meant a
+          // shutter click on every single frame, continuously, for as long as
+          // the session stayed connected.
+          const photo = await cameraRef.current.takePictureAsync({ base64: true, quality: 0.5, skipProcessing: true, shutterSound: false });
+          if (photo?.base64 && socketRef.current?.ready) socketRef.current.sendImage(photo.base64);
+        } catch (e) { /* camera transiently busy — skip this tick */ }
+      }
+      if (epochRef.current !== myEpoch) { stopFrameLoop(); return; }
+      frameIntervalRef.current = setTimeout(tick, nextFrameDelay());
+    };
+    frameIntervalRef.current = setTimeout(tick, FRAME_MS);
   }
 
-  function stopFrameLoop() { if (frameIntervalRef.current) { clearInterval(frameIntervalRef.current); frameIntervalRef.current = null; } }
+  function stopFrameLoop() { if (frameIntervalRef.current) { clearTimeout(frameIntervalRef.current); frameIntervalRef.current = null; } }
 
   function enqueueAudio(b64: string) {
     audioQueueRef.current.push(b64);

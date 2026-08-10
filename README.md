@@ -149,7 +149,7 @@ gcloud run deploy argus \n  --source . \n  --region us-central1 \n  --allow-unau
 Argus/
 ├── backend/
 │   ├── server.js          # Express + WebSocket + Gemini Live API relay
-│   ├── agents.js          # 14 tools across 7 domain agents + system instruction
+│   ├── agents.js          # 15 tools across 7 domain agents + system instruction
 │   ├── memory.js          # Firestore persistent memory (cross-session)
 │   ├── weather.js         # Real-time weather via Open-Meteo (no API key)
 │   ├── package.json
