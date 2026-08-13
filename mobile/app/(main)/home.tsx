@@ -11,6 +11,13 @@ import type { User } from "../../services/auth";
 type Status = "dormant"|"connecting"|"observing"|"speaking"|"error";
 type Line = { text: string; role: "argus"|"user"|"tool" };
 
+// Tried 400 (down from 1000) to cut mic-buffering delay — made things worse,
+// not better: backend turn latency and barge-in rate stayed fine, so the
+// regression wasn't Gemini, it was audio quality reaching it. Each cycle is a
+// real stop/unload/prepare/start native round trip, not a continuous stream;
+// at 400ms that fixed overhead is a much bigger fraction of a much smaller
+// window, so more of the user's actual speech was lost to restart gaps than
+// was saved in buffering time. Back to 1000, the known-good value.
 const CHUNK_MS = 1000;
 // Camera frames dominate the Gemini Live context window: video bills at 258
 // tokens/sec against 25 tokens/sec for audio, so at a flat 2s cadence a real
@@ -30,7 +37,14 @@ const FRAME_MS_IDLE = 5000;
 // counts as active. One full turn (speak → respond) keeps traffic flowing well
 // inside this, so the cadence only drops during real lulls.
 const FRAME_IDLE_AFTER_MS = 6000;
-const AUDIO_GAIN = 1.6;
+// Was 1.6 (tuned for the earpiece->speaker routing fix alone, known issue
+// #20/#21), then 2.4 (still too quiet). AVAudioSessionModeVoiceChat (added
+// for echo cancellation) attenuates output as a side effect — it needs a
+// level-controlled copy of what's playing to use as its cancellation
+// reference. Untested past this point — bump further or pull back if 3.2
+// clips (the int16 clamp below prevents wraparound, but clamping itself
+// sounds like distortion at the ceiling).
+const AUDIO_GAIN = 3.2;
 const CONNECT_TIMEOUT_MS = 12000;
 
 const TOOL_LABELS: Record<string, string> = {
@@ -259,7 +273,7 @@ export default function Home() {
           // Encode + send run off the loop's critical path so the mic comes
           // back up immediately instead of sitting idle through a network
           // round trip — that wait was the dominant chunk of dead-air in
-          // each ~1s cycle and was audible as cutting in and out.
+          // each recording cycle and was audible as cutting in and out.
           if (uri) {
             // Re-read the current socket at send time rather than sending to a
             // captured one: a captured socket could still be OPEN after the app
