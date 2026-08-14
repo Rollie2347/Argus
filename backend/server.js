@@ -383,15 +383,31 @@ wss.on("connection", async (clientWs, req) => {
         // terminate — no error, just an onclose. Sliding-window compression
         // lets sessions run indefinitely instead.
         contextWindowCompression: { slidingWindow: {} },
-        // Reverted 2026-08-07: an explicit realtimeInputConfig.automaticActivityDetection
-        // (silenceDurationMs/prefixPaddingMs) was added here as a Bug 1 mitigation, but
-        // the very first live session on the revision that shipped it hit a fatal
-        // "Gemini session closed 1007 CONTENT_TYPE_AUDIO is not supported for this model
-        // configuration" mid-conversation, right after a barge-in interruption — an error
-        // never seen once in the prior 30 days of logs. Single data point, not proven,
-        // but a full crash outweighs the mid-sentence-interruption annoyance it was
-        // mitigating — back off to Gemini's defaults until this can be confirmed safe.
-        // See CLAUDE.md known issues for the full trace.
+        // Retried 2026-08-13, different goal than the 2026-08-07 attempt (see
+        // CLAUDE.md known issue #27): that one *raised* silenceDurationMs to
+        // 1500ms to tolerate the mic's own chunked-recording dead-air, and hit
+        // a fatal "Gemini session closed 1007 CONTENT_TYPE_AUDIO is not
+        // supported for this model configuration" mid-conversation, right
+        // after a barge-in interruption. This time the goal is speed —
+        // *lowering* silenceDurationMs below Gemini's ~800ms default so it
+        // decides a turn is over sooner — attempted now because the mic
+        // dead-air problem that motivated raising it is separately fixed
+        // (known issues #33/#35), and barge-in interruptions (the condition
+        // present right before the prior crash) are ~3.5x rarer since the
+        // echo-cancellation fix (known issue #38). Still real, undiscarded
+        // risk: only one data point on the crash, and it's not proven the
+        // trigger was the silenceDurationMs value versus this config field
+        // existing at all on this preview model. Watch the first live
+        // sessions closely — onclose/onerror already log the real reason,
+        // and `interrupted`/turn-latency logging is already in place to
+        // catch this fast if it recurs. Revert (delete this whole block) at
+        // the first sign of it.
+        realtimeInputConfig: {
+          automaticActivityDetection: {
+            silenceDurationMs: 500,
+            prefixPaddingMs: 200,
+          },
+        },
         speechConfig: {
           voiceConfig: {
             prebuiltVoiceConfig: { voiceName: "Puck" },

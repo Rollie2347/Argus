@@ -37,14 +37,19 @@ const FRAME_MS_IDLE = 5000;
 // counts as active. One full turn (speak → respond) keeps traffic flowing well
 // inside this, so the cadence only drops during real lulls.
 const FRAME_IDLE_AFTER_MS = 6000;
-// Was 1.6 (tuned for the earpiece->speaker routing fix alone, known issue
-// #20/#21), then 2.4 (still too quiet). AVAudioSessionModeVoiceChat (added
-// for echo cancellation) attenuates output as a side effect — it needs a
-// level-controlled copy of what's playing to use as its cancellation
-// reference. Untested past this point — bump further or pull back if 3.2
-// clips (the int16 clamp below prevents wraparound, but clamping itself
-// sounds like distortion at the ceiling).
-const AUDIO_GAIN = 3.2;
+// Was a hard-clamped linear multiplier (1.6 -> 2.4 -> 3.2 -> 4.5 across four
+// rounds), still reported quiet even at 4.5. Switched to a tanh soft-clip
+// (see the boost loop below) instead of pushing the linear value even
+// higher: a hard clamp only affects samples that already exceed the
+// ceiling, so most of a real speech waveform (which has real headroom above
+// its RMS level) was passing through unclipped and just... quiet, while the
+// loudest peaks were flat-topping into harsh, odd-harmonic-heavy distortion
+// — a real candidate for what read as "muffled," separate from the
+// AVAudioSessionModeVoiceChat bandwidth theory. tanh saturates smoothly
+// instead of flat-topping, so this gain can run meaningfully hotter for the
+// same (or better) distortion character. Value is inside the tanh, not a
+// direct output multiplier — not comparable to the old linear numbers.
+const AUDIO_GAIN = 5.0;
 const CONNECT_TIMEOUT_MS = 12000;
 
 const TOOL_LABELS: Record<string, string> = {
@@ -106,12 +111,14 @@ function pcmChunksToWavBase64(pcmB64Chunks: string[], sampleRate: number): strin
     for (let i = 0; i < bin.length; i++) bytes[offset + i] = bin.charCodeAt(i);
     offset += bin.length;
   }
-  // Gemini's output level plus iOS's playAndRecord routing (see home.tsx's
-  // volume note) both leave played-back audio quieter than expected — apply a
-  // digital gain with clamping so int16 samples don't wrap on overflow.
+  // Gemini's output level plus iOS's playAndRecord routing leave played-back
+  // audio quieter than expected — boost it. tanh saturates smoothly toward
+  // ±32767 instead of flat-topping there, so it's always in range with no
+  // separate clamp needed, and sounds like soft compression at the peaks
+  // rather than harsh digital clipping.
   for (let i = headerLen; i < buf.byteLength - 1; i += 2) {
     const sample = view.getInt16(i, true);
-    const boosted = Math.max(-32768, Math.min(32767, Math.round(sample * AUDIO_GAIN)));
+    const boosted = Math.round(Math.tanh((sample / 32768) * AUDIO_GAIN) * 32767);
     view.setInt16(i, boosted, true);
   }
 
