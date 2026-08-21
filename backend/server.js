@@ -513,31 +513,27 @@ wss.on("connection", async (clientWs, req) => {
         // terminate — no error, just an onclose. Sliding-window compression
         // lets sessions run indefinitely instead.
         contextWindowCompression: { slidingWindow: {} },
-        // Retried 2026-08-13, different goal than the 2026-08-07 attempt (see
-        // CLAUDE.md known issue #27): that one *raised* silenceDurationMs to
-        // 1500ms to tolerate the mic's own chunked-recording dead-air, and hit
-        // a fatal "Gemini session closed 1007 CONTENT_TYPE_AUDIO is not
-        // supported for this model configuration" mid-conversation, right
-        // after a barge-in interruption. This time the goal is speed —
-        // *lowering* silenceDurationMs below Gemini's ~800ms default so it
-        // decides a turn is over sooner — attempted now because the mic
-        // dead-air problem that motivated raising it is separately fixed
-        // (known issues #33/#35), and barge-in interruptions (the condition
-        // present right before the prior crash) are ~3.5x rarer since the
-        // echo-cancellation fix (known issue #38). Still real, undiscarded
-        // risk: only one data point on the crash, and it's not proven the
-        // trigger was the silenceDurationMs value versus this config field
-        // existing at all on this preview model. Watch the first live
-        // sessions closely — onclose/onerror already log the real reason,
-        // and `interrupted`/turn-latency logging is already in place to
-        // catch this fast if it recurs. Revert (delete this whole block) at
-        // the first sign of it.
-        realtimeInputConfig: {
-          automaticActivityDetection: {
-            silenceDurationMs: 500,
-            prefixPaddingMs: 200,
-          },
-        },
+        // DO NOT re-add `realtimeInputConfig.automaticActivityDetection` here
+        // without new evidence. It has now been tried TWICE and produced the
+        // same fatal crash both times:
+        //   - 2026-08-07 (known issue #27): raised silenceDurationMs to
+        //     1500ms; session died with `1007 The audio content type
+        //     (CONTENT_TYPE_AUDIO) is not supported for this model
+        //     configuration` shortly after a barge-in interruption.
+        //   - 2026-08-13: re-added with the opposite goal (LOWERING
+        //     silenceDurationMs to 500ms for speed), on the reasoning that
+        //     the first crash might have been specific to the raised value.
+        //     Confirmed 2026-08-21 on build 40 / revision argus-00027-fs9:
+        //     identical `1007` close, again mid-conversation, again in a
+        //     barge-in-heavy session — and the user-visible symptom was the
+        //     app dropping to the dormant home screen with the question
+        //     unanswered.
+        // Two attempts, opposite parameter directions, identical failure:
+        // the trigger is this config field EXISTING on this preview model,
+        // not the value it carries. Gemini's default VAD (~800ms silence)
+        // works fine; the ~300ms it might save is not worth a hard session
+        // kill. If turn-end latency ever needs tuning again, do it on the
+        // client (mic chunking) or by changing models — not here.
         speechConfig: {
           voiceConfig: {
             prebuiltVoiceConfig: { voiceName: "Puck" },
