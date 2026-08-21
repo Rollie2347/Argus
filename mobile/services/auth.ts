@@ -13,6 +13,13 @@ export type User = { id: string; name: string; email: string };
 // one"). Scoping by id means a fresh uid never sees a stale value.
 function secretKey(id: string) { return `argus_secret_${id}`; }
 
+// Exposed so profile-setup/settings can authenticate the profile POST route
+// the same way deleteAccount does, without duplicating the Keychain key
+// scheme (see secretKey's comment above for why it's scoped per-id).
+export async function getDeviceSecret(id: string): Promise<string | null> {
+  return SecureStore.getItemAsync(secretKey(id));
+}
+
 // Claims (or re-claims) this device's secret so destructive calls (e.g.
 // delete) can be authorized instead of trusting the id alone. Safe to retry:
 // the backend only refuses once a secret is actually set for this id, so a

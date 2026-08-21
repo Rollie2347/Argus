@@ -13,7 +13,21 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { WebSocketServer, WebSocket } from "ws";
 import { buildSystemInstruction, TOOLS, handleToolCall } from "./agents.js";
-import { deleteUserData, claimUserSecret, verifyDeviceSecret, reserveGlobalSlot, releaseGlobalSlot } from "./memory.js";
+import {
+  deleteUserData,
+  claimUserSecret,
+  verifyDeviceSecret,
+  reserveGlobalSlot,
+  releaseGlobalSlot,
+  getUserMemory,
+  updateUserMemory,
+  computeProfileStatus,
+  setHomeLocation,
+  setPeople,
+  setPersonality,
+  markProfileReviewed,
+  DEFAULT_PERSONALITY,
+} from "./memory.js";
 
 dotenv.config();
 
@@ -22,6 +36,16 @@ const PORT = process.env.PORT || 8080;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const WS_SHARED_SECRET = process.env.WS_SHARED_SECRET;
 const MODEL = "gemini-2.5-flash-native-audio-preview-12-2025";
+// Unset by default — matches existing behavior exactly (the model's own
+// automatic thinking budget, whatever that is for this preview model).
+// LiveConnectConfig.thinkingConfig.thinkingBudget accepts 0 (disabled), -1
+// (automatic), or a token count; see the @google/genai SDK's genai.d.ts.
+// Deliberately not defaulted to a reduced value — CLAUDE.md's Phase 5 design
+// explicitly said not to cut thinking budget blindly, and the tradeoff can
+// only be judged from real sessions (the turn-latency logging below), which
+// requires a real deploy this env var can then be redeployed with different
+// values for, without a code change each time.
+const THINKING_BUDGET = process.env.THINKING_BUDGET !== undefined ? parseInt(process.env.THINKING_BUDGET, 10) : null;
 
 // Validate required env vars at startup
 if (!GEMINI_API_KEY) {
@@ -64,6 +88,7 @@ function httpRateLimit(windowMs, max) {
 // Express app
 const app = express();
 const server = createServer(app);
+app.use(express.json({ limit: "100kb" })); // profile POST body only — small, structured
 
 // Per-IP HTTP limit. Same CGNAT reasoning as WS_MAX_CONN_PER_IP: every new
 // install calls POST /api/user/:id/claim once, so a few hundred users sharing
@@ -110,6 +135,70 @@ app.delete("/api/user/:userId", async (req, res) => {
     res.json({ status: "deleted" });
   } catch (err) {
     console.error("Delete user data error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Same Bearer device-secret auth as POST/DELETE. This returns name, home
+// city, and family/friends' names+relations — real PII, and userIds appear
+// in plaintext in Cloud Run request logs (known issue #32), so trusting the
+// self-asserted userId alone here would let anyone who's seen a userId pull
+// another user's profile. Used by mobile routing to decide whether the
+// setup form should block home.tsx.
+app.get("/api/user/:userId/profile", async (req, res) => {
+  const authHeader = req.headers.authorization || "";
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+  if (!(await verifyDeviceSecret(req.params.userId, token))) {
+    return res.status(403).json({ error: "forbidden" });
+  }
+  try {
+    const mem = await getUserMemory(req.params.userId);
+    res.json({
+      status: computeProfileStatus(mem),
+      name: mem.name || null,
+      homeLocation: mem.homeLocation || null,
+      people: mem.people || [],
+      personality: mem.personality || DEFAULT_PERSONALITY,
+    });
+  } catch (err) {
+    console.error("Get profile error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Same Bearer device-secret auth as DELETE — this writes identity data, not
+// just preferences, so it shouldn't trust the self-asserted userId alone.
+// markReviewed is an explicit client-sent flag rather than being inferred
+// from which fields are present: the setup form and a settings-only
+// personality edit both POST here, but only the former should reset the
+// 30-day recheck clock (see computeProfileStatus in memory.js).
+app.post("/api/user/:userId/profile", async (req, res) => {
+  const authHeader = req.headers.authorization || "";
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+  if (!(await verifyDeviceSecret(req.params.userId, token))) {
+    return res.status(403).json({ error: "forbidden" });
+  }
+  try {
+    const userId = req.params.userId;
+    const { name, homeCity, people, personality, markReviewed } = req.body || {};
+    const tasks = [];
+    if (typeof name === "string" && name.trim()) {
+      tasks.push(updateUserMemory(userId, { name: name.trim().slice(0, 100) }));
+    }
+    if (typeof homeCity === "string" && homeCity.trim()) {
+      tasks.push(setHomeLocation(userId, homeCity.trim()));
+    }
+    // One write for the whole list — see setPeople in memory.js for why this
+    // isn't a loop of addPerson calls.
+    if (Array.isArray(people)) tasks.push(setPeople(userId, people));
+    if (personality && typeof personality === "object") {
+      tasks.push(setPersonality(userId, personality));
+    }
+    await Promise.all(tasks);
+    if (markReviewed) await markProfileReviewed(userId);
+    res.json({ status: "ok" });
+  } catch (err) {
+    console.error("Update profile error:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -185,6 +274,37 @@ function sanitizeLocationField(s) {
     .replace(/[^\p{L}\p{N}\s,.'-]/gu, "")
     .slice(0, 100)
     .trim();
+}
+
+// Replicates @google/genai's LiveServerMessage.data getter (walks
+// serverContent.modelTurn.parts, concatenates inlineData) without going
+// through that getter directly. The SDK's own getter warns on ANY
+// non-inlineData field present in a part — including `thought` fields,
+// unlike its sibling .text getter, which explicitly excludes `thought` from
+// its equivalent warning (verified in the SDK source, dist/node/index.cjs).
+// This model streams thinking content in most responses by default, so
+// every access to msg.data was logging "there are non-data parts
+// [thought]..." and re-walking every part — the exact bug class known issue
+// #33 already fixed for msg.text, just via the sibling getter this time.
+function extractAudioData(msg) {
+  const parts = msg.serverContent && msg.serverContent.modelTurn && msg.serverContent.modelTurn.parts;
+  if (!parts) return undefined;
+  // Collect first so the overwhelmingly common single-part case can skip the
+  // decode/re-encode entirely. The SDK unconditionally does atob() on every
+  // part then btoa() on the concatenation; for one part that round trip is
+  // pure waste on the hot audio path (a ~43KB base64 chunk per second per
+  // session), and CPU — not memory — is the binding Cloud Run constraint
+  // here (see CLAUDE.md known issue #36). Multi-part still concatenates raw
+  // bytes before re-encoding, matching the SDK's semantics exactly.
+  const encoded = [];
+  for (const part of parts) {
+    if (part.inlineData && typeof part.inlineData.data === "string") {
+      encoded.push(part.inlineData.data);
+    }
+  }
+  if (encoded.length === 0) return undefined;
+  if (encoded.length === 1) return encoded[0];
+  return btoa(encoded.map((e) => atob(e)).join(""));
 }
 
 function validSecret(secret) {
@@ -354,6 +474,16 @@ wss.on("connection", async (clientWs, req) => {
   let turnAudioChunks = 0;
   let lastTurnEndedAt = 0;
   let userSpeechOpen = false;
+  // Response-latency instrumentation for the Phase 5 thinking-budget A/B
+  // (see THINKING_BUDGET above). The existing "Turn latency" metric is
+  // known-flawed (see known issue #35 in CLAUDE.md) — it measures from the
+  // last forwarded 1s audio chunk, which the client sends every second
+  // whether or not anyone is speaking, so it can never exceed ~1s and isn't
+  // real response latency. This measures from the last actual user-speech
+  // transcription chunk to the first sign of a response instead — still an
+  // approximation (transcription lags real speech end slightly), but a much
+  // closer proxy, and the only one available without client-side changes.
+  let lastUserSpeechAt = 0;
 
   try {
     // Build dynamic system instruction with live memory, weather + location context
@@ -413,6 +543,10 @@ wss.on("connection", async (clientWs, req) => {
             prebuiltVoiceConfig: { voiceName: "Puck" },
           },
         },
+        // See THINKING_BUDGET above — omitted entirely (not even sent as
+        // undefined) when unset, so the model's own default applies exactly
+        // as before this existed.
+        ...(THINKING_BUDGET !== null ? { thinkingConfig: { thinkingBudget: THINKING_BUDGET } } : {}),
         systemInstruction: {
           parts: [{ text: systemInstruction }],
         },
@@ -420,7 +554,7 @@ wss.on("connection", async (clientWs, req) => {
       },
       callbacks: {
         onopen: () => {
-          console.log("🔗 Connected to Gemini Live API");
+          console.log(`🔗 Connected to Gemini Live API (thinkingBudget=${THINKING_BUDGET === null ? "model default" : THINKING_BUDGET})`);
           if (clientWs.readyState === WebSocket.OPEN) {
             clientWs.send(JSON.stringify({ type: "connected" }));
           }
@@ -430,11 +564,18 @@ wss.on("connection", async (clientWs, req) => {
           if (clientWs.readyState !== WebSocket.OPEN) return;
 
           try {
+            // Computed once per message via extractAudioData (below) instead
+            // of reading the SDK's own msg.data getter — see that function's
+            // comment for why. Every one of this block's several checks below
+            // used to call msg.data directly, each one re-triggering the
+            // getter's warning and re-walking/re-concatenating every part.
+            const audioData = extractAudioData(msg);
+
             // First sign of a new turn's response (tool call, audio, or
             // transcript text) after the user finished talking — logs how
             // long Gemini actually took to start responding, separate from
             // connection-open latency.
-            const isResponseActivity = !!(msg.toolCall || msg.data || (msg.serverContent && msg.serverContent.outputTranscription && msg.serverContent.outputTranscription.text));
+            const isResponseActivity = !!(msg.toolCall || audioData || (msg.serverContent && msg.serverContent.outputTranscription && msg.serverContent.outputTranscription.text));
             if (isResponseActivity && !responseInFlight) {
               responseInFlight = true;
               turnStartedAt = Date.now();
@@ -444,8 +585,11 @@ wss.on("connection", async (clientWs, req) => {
               if (lastAudioForwardedAt) {
                 console.log(`⏱️ Turn latency: ${Date.now() - lastAudioForwardedAt}ms`);
               }
+              if (lastUserSpeechAt) {
+                console.log(`🎯 Response latency (last user speech → response start): ${Date.now() - lastUserSpeechAt}ms`);
+              }
             }
-            if (msg.data) turnAudioChunks++;
+            if (audioData) turnAudioChunks++;
 
             // When the user's own speech starts/stops, per inputAudioTranscription.
             // A long gap with NO user-speech events means dead air on the mic
@@ -454,6 +598,7 @@ wss.on("connection", async (clientWs, req) => {
             const inTr = msg.serverContent && msg.serverContent.inputTranscription;
             if (inTr && inTr.text) {
               if (!userSpeechOpen) { userSpeechOpen = true; console.log("🎙️ User speech detected"); }
+              lastUserSpeechAt = Date.now();
               if (process.env.LOG_TRANSCRIPT_TEXT === "1") {
                 console.log(`   user said: ${String(inTr.text).slice(0, 80)}`);
               }
@@ -499,12 +644,8 @@ wss.on("connection", async (clientWs, req) => {
             }
 
             // Handle audio response
-            if (msg.data) {
-              const audioB64 =
-                typeof msg.data === "string"
-                  ? msg.data
-                  : Buffer.from(msg.data).toString("base64");
-              clientWs.send(JSON.stringify({ type: "audio", data: audioB64 }));
+            if (audioData) {
+              clientWs.send(JSON.stringify({ type: "audio", data: audioData }));
             }
 
             // NOTE: do not touch msg.text here. This session is AUDIO-only
@@ -542,6 +683,7 @@ wss.on("connection", async (clientWs, req) => {
               turnStartedAt = 0;
               responseInFlight = false;
               userSpeechOpen = false;
+              lastUserSpeechAt = 0;
             }
           } catch (err) {
             console.error("Error processing Gemini message:", err.message);

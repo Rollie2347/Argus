@@ -22,8 +22,12 @@ import {
   appendUserListField,
   removePreference,
   removeUserListField,
+  setHomeLocation,
+  addPerson,
+  removePerson,
+  markProfileReviewed,
 } from "./memory.js";
-import { getWeather, weatherToContext } from "./weather.js";
+import { getWeather, weatherToContext, distanceMiles } from "./weather.js";
 
 // Initialize Firestore (async — errors are caught inside initFirestore)
 initFirestore().then(ok => {
@@ -154,6 +158,25 @@ export const TOOLS = [
           },
           required: ["category", "value"]
         }
+      },
+      {
+        name: "update_profile",
+        description: "Store or update a core profile fact: the user's name, home location, or an important person in their life (family, friends, etc). Use during a profile recheck, or whenever the user states a new or changed core fact — for looser one-off facts, use remember_preference instead.",
+        parameters: {
+          type: "OBJECT",
+          properties: {
+            field: { type: "STRING", enum: ["name", "home_location", "person"] },
+            action: { type: "STRING", enum: ["set", "remove"], description: "'remove' only applies to field=person" },
+            value: { type: "STRING", description: "For field=name: the name. For field=home_location: the city (e.g. 'Austin, Texas'). For field=person: the person's name." },
+            relation: { type: "STRING", description: "Only for field=person and action=set — how they relate to the user (e.g. spouse, kid, friend, roommate)." }
+          },
+          required: ["field", "action", "value"]
+        }
+      },
+      {
+        name: "mark_profile_reviewed",
+        description: "Call this once a profile recheck check-in is actually complete — the user confirmed or corrected their location/life details. Do not call this just because a session started; only after the check-in itself finished.",
+        parameters: { type: "OBJECT", properties: {}, required: [] }
       },
       {
         name: "recall_memory",
@@ -354,6 +377,26 @@ export async function handleToolCall(functionCall, userId) {
       return { stored: true, category: args.category, key: args.key, value: args.value };
     }
 
+    case "update_profile": {
+      if (args.field === "name") {
+        await updateUserMemory(userId, { name: String(args.value).slice(0, 100) });
+      } else if (args.field === "home_location") {
+        await setHomeLocation(userId, args.value);
+      } else if (args.field === "person") {
+        if (args.action === "remove") {
+          const removed = await removePerson(userId, args.value);
+          return { updated: removed, field: "person", action: "remove", value: args.value };
+        }
+        await addPerson(userId, args.value, args.relation || "");
+      }
+      return { updated: true, field: args.field, action: args.action, value: args.value };
+    }
+
+    case "mark_profile_reviewed": {
+      await markProfileReviewed(userId);
+      return { reviewed: true };
+    }
+
     case "recall_memory": {
       // Never spread the raw Firestore doc back to Gemini — it also holds
       // `deviceSecret` (the bearer credential that authorizes destructive
@@ -371,6 +414,8 @@ export async function handleToolCall(functionCall, userId) {
         const mem = await getUserMemory(userId);
         return {
           name: mem.name || null,
+          homeLocation: mem.homeLocation || null,
+          people: mem.people || [],
           dietaryPreferences: mem.dietaryPreferences || [],
           allergies: mem.allergies || [],
           preferences: boundPreferences(collectPreferences(mem)),
@@ -388,6 +433,8 @@ export async function handleToolCall(functionCall, userId) {
         ]);
         return {
           name: mem.name || null,
+          homeLocation: mem.homeLocation || null,
+          people: mem.people || [],
           dietaryPreferences: mem.dietaryPreferences || [],
           allergies: mem.allergies || [],
           preferences: boundPreferences(collectPreferences(mem)),
@@ -466,25 +513,88 @@ export async function handleToolCall(functionCall, userId) {
 // SYSTEM INSTRUCTION
 // ============================================================
 
+// Composed from independent per-axis snippets rather than 12 hand-written
+// tone x verbosity x proactivity combinations — deterministic templating was
+// the whole point of making personality a structured choice instead of
+// freeform text (see CLAUDE.md's Phase 3 design). Falls back to the default
+// axis value for any unrecognised input so a malformed/legacy stored value
+// can't produce an empty line in the prompt.
+function buildPersonalityBlock(personality) {
+  const tone = {
+    warm: "Warm and friendly — like a knowledgeable friend who happens to see everything.",
+    direct: "Direct and efficient — get to the point, skip the small talk.",
+    playful: "Playful and a little irreverent — genuine personality, not just helpfulness.",
+  }[personality.tone] || "Warm and friendly — like a knowledgeable friend who happens to see everything.";
+  const verbosity = {
+    concise: "Keep voice responses SHORT — 1-3 sentences unless real detail is asked for.",
+    detailed: "Give fuller answers when there's real detail worth sharing — still voice-paced, not a wall of text.",
+  }[personality.verbosity] || "Keep voice responses SHORT — 1-3 sentences unless real detail is asked for.";
+  const proactivity = {
+    proactive: "Notice things and speak up unprompted about what you see — mention them once, don't repeat.",
+    on_request: "Wait to be asked before offering suggestions or observations — don't volunteer unprompted commentary.",
+  }[personality.proactivity] || "Notice things and speak up unprompted about what you see — mention them once, don't repeat.";
+  return `- ${tone}\n- ${verbosity}\n- ${proactivity}\n- Contextually appropriate — energetic in the morning, calm in the evening.\n- Remembers and references past interactions naturally.`;
+}
+
 export async function buildSystemInstruction(lat, lon, city, userId) {
   // Build dynamic context from memory + weather
-  const [memoryContext, weather] = await Promise.all([
+  const [memory, weather] = await Promise.all([
     buildMemoryContext(userId),
     getWeather(lat, lon),
   ]);
+  const memoryContext = memory.text;
+  const personality = memory.personality;
   const weatherContext = weatherToContext(weather);
 
   const now = new Date();
   const timeStr = now.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", hour12: true, timeZone: process.env.TIMEZONE || "America/Chicago" });
   const dateStr = now.toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", timeZone: process.env.TIMEZONE || "America/Chicago" });
 
+  // Fires once per session at most, driven by profileStatus (see
+  // computeProfileStatus in memory.js) — either 30+ days since the last
+  // review, or an account that predates this feature entirely (has a name
+  // but was never structurally reviewed). This IS the migration path for
+  // pre-existing accounts, not a separate backfill script — see memory.js.
+  // Home vs. current location. `city`/`lat`/`lon` here come from IP
+  // geolocation — i.e. where the user is right now — while homeLocation is
+  // the durable, user-confirmed profile field. Comparing them is the whole
+  // point of storing home coordinates: without it Argus can't tell a user
+  // who's travelling from one who just moved, and would either give
+  // home-anchored advice to someone 800 miles away or quietly treat a trip
+  // as a permanent relocation. 50 miles is deliberately loose — it should
+  // read as "same metro area", not "same address".
+  const home = memory.homeLocation;
+  let locationBlock = "";
+  if (home && Number.isFinite(home.lat) && Number.isFinite(home.lon) && Number.isFinite(lat) && Number.isFinite(lon)) {
+    const miles = distanceMiles(lat, lon, home.lat, home.lon);
+    locationBlock = miles <= 50
+      ? `\nThe user is currently at home (${home.city}).`
+      : `\nThe user is currently AWAY from home — about ${Math.round(miles)} miles from home (${home.city}). Don't assume home-based context (their kitchen, their usual stores, their routine) applies right now; ask if it matters.`;
+  }
+
+  const recheckBlock = memory.profileStatus === "recheck_due"
+    ? `\n## PROFILE RECHECK DUE\nIt's been a while since this profile was confirmed (or it was never confirmed). The next time you speak first this session, briefly and naturally ask if anything's changed — especially whether they still live in ${memory.homeCity || "the same place"} — before moving on to anything else. Keep it to one or two sentences, not an interrogation. Once they've confirmed or told you what changed, use update_profile to save any changes, then call mark_profile_reviewed.\n`
+    : "";
+
+  const proactiveSection = personality.proactivity === "proactive"
+    ? `## PROACTIVE BEHAVIORS
+You don't just respond — you NOTICE and SPEAK UP:
+- See groceries on the counter → "Want me to help track what you're putting away?"
+- It's getting late + user hasn't eaten → "It's almost 8, want me to suggest a quick dinner?"
+- See car keys → "Don't forget, you mentioned needing to pick up dry cleaning"
+- Weather is bad + they're heading out → "Heads up, it's ${weather ? weather.temperature + '°F and ' + weather.condition : 'cold'} out there"
+- Notice new item in kitchen → "That's new! Want me to add it to your usual inventory?"`
+    : `## PROACTIVE BEHAVIORS
+This user has asked not to be given unprompted observations — wait until asked, then answer well. Don't volunteer noticing things unless it's safety-relevant (e.g. something actively dangerous).`;
+
   return `You are Argus, an all-seeing AI life companion named after Argus Panoptes — the hundred-eyed guardian of Greek mythology.
 
 ## CURRENT CONTEXT
 Time: ${timeStr}, ${dateStr}
-Location: ${city || "unknown location"}
+Location: ${city || "unknown location"}${locationBlock}
 ${weatherContext}
 ${memoryContext ? `\n## USER MEMORY\n${memoryContext}` : ""}
+${recheckBlock}
 
 ## ROLE
 You see the user's world through their camera, hear them naturally, and help optimize their daily life. You are not a chatbot — you are a companion that lives in their world.
@@ -536,30 +646,19 @@ When the user asks about a specific restaurant:
 - Time-aware help (morning routine vs evening wind-down)
 - Proactive nudges based on what you know and see
 
-## PROACTIVE BEHAVIORS
-You don't just respond — you NOTICE and SPEAK UP:
-- See groceries on the counter → "Want me to help track what you're putting away?"
-- It's getting late + user hasn't eaten → "It's almost 8, want me to suggest a quick dinner?"
-- See car keys → "Don't forget, you mentioned needing to pick up dry cleaning"
-- Weather is bad + they're heading out → "Heads up, it's ${weather ? weather.temperature + '°F and ' + weather.condition : 'cold'} out there"
-- Notice new item in kitchen → "That's new! Want me to add it to your usual inventory?"
+${proactiveSection}
 
 ## PERSONALITY
-- Warm, friendly, efficient — like a knowledgeable friend who happens to see everything
-- Proactive but not nagging — mention things once, don't repeat
-- Contextually appropriate — energetic in the morning, calm in the evening
-- Remembers and references past interactions naturally
-- Slightly witty but never annoying
-- Concise — 1-3 sentences for voice unless more detail is needed
+${buildPersonalityBlock(personality)}
 
 ## RULES
 - Use your tools actively — store memories, log activities, check weather
 - When users mention personal details, ALWAYS use remember_preference to store them
+- When the user states a new or corrected core fact — their name, home location, or an important person in their life — use update_profile, not remember_preference (which is for looser one-off facts)
 - When a user corrects or retracts something you remembered, use forget_memory — never store a contradicting value alongside the old one
-- Only name, dietary preferences and allergies are given to you up front; use recall_memory when you need anything else you've stored
+- Only name, home location, important people, dietary preferences and allergies are given to you up front; use recall_memory when you need anything else you've stored
 - Reference memory naturally ("last time you made this..." / "you mentioned you're allergic to...")
-- Keep voice responses SHORT (1-3 sentences)
-- Be grounded — if you can't see clearly, say so
+- Be grounded about what you can actually see: if the camera feed is dark, obstructed, or otherwise gives you nothing usable, say so plainly — but don't stop there. If the question doesn't actually require seeing anything (weather, a timer, a recipe from memory, general advice, something you already know from earlier), answer it anyway in the shape "I can't see anything right now, but ___." Only decline to answer when the specific question genuinely can't be answered without seeing something.
 - Handle interruptions gracefully
 - When in doubt, be helpful`;
 }

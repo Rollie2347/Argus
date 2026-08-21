@@ -2,7 +2,8 @@ import { useState } from "react";
 import { View, Text, TouchableOpacity, StyleSheet, ScrollView, Linking, Alert } from "react-native";
 import { router } from "expo-router";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { setAiConsent } from "../services/auth";
+import { setAiConsent, getStoredUser, getDeviceSecret } from "../services/auth";
+import { fetchProfile } from "../services/profile";
 import { BACKEND } from "../services/websocket";
 
 // Apple guideline 5.1.1(i)/5.1.2(i): before an app sends personal data to a
@@ -16,6 +17,13 @@ export default function Consent() {
   async function agree() {
     setLoading(true);
     await setAiConsent();
+    const user = await getStoredUser();
+    const secret = user ? await getDeviceSecret(user.id) : null;
+    const profile = user ? await fetchProfile(user.id, secret) : null;
+    if (profile?.status === "needs_interview") {
+      router.replace("/profile-setup");
+      return;
+    }
     const onboarded = await AsyncStorage.getItem("argus_onboarded");
     router.replace(onboarded ? "/(main)/home" : "/onboarding");
   }

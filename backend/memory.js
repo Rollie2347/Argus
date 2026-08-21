@@ -6,6 +6,7 @@
  */
 
 import { Firestore, FieldValue } from "@google-cloud/firestore";
+import { geocodeCity } from "./weather.js";
 import { existsSync } from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -245,6 +246,131 @@ function asList(value) {
 }
 
 // ============================================================
+// PROFILE — small, curated, always-injected facts (name, home
+// location, key people, personality). Distinct from the freeform
+// `preferences` map above: these are structured fields captured
+// through the setup form / recheck (see agents.js's update_profile
+// tool and server.js's /api/user/:userId/profile route), not
+// accreted incidentally from conversation the way `preferences` is.
+//
+// Kept as flat/whole-object top-level fields deliberately, same
+// reasoning as `preferences` above: known issue #16 showed a dotted
+// sub-path merge silently writes a literal dotted field name instead
+// of nesting. Every write here replaces a whole field/object/array in
+// one set() call, never a sub-path — so that bug class can't recur.
+// ============================================================
+
+export const DEFAULT_PERSONALITY = { tone: "warm", verbosity: "concise", proactivity: "proactive" };
+const PERSONALITY_OPTIONS = {
+  tone: ["warm", "direct", "playful"],
+  verbosity: ["concise", "detailed"],
+  proactivity: ["proactive", "on_request"],
+};
+const MAX_PEOPLE = 15;
+const RECHECK_INTERVAL_DAYS = 30;
+
+// Stores coordinates alongside the city name. IP geolocation only ever
+// reports where the user is *at this moment*, so without a durable home
+// coordinate there's no way to tell "at home" from "travelling" — which is
+// exactly why home location is a curated profile field rather than
+// something inferred per-connection. Geocoding failure is non-fatal: the
+// city string alone is still useful context, so the field is written either
+// way and simply carries no coords.
+export async function setHomeLocation(userId, city) {
+  const cityName = String(city).trim().slice(0, 100);
+  const coords = await geocodeCity(cityName);
+  await updateUserMemory(userId, {
+    homeLocation: {
+      city: cityName,
+      lat: coords ? coords.lat : null,
+      lon: coords ? coords.lon : null,
+      updatedAt: new Date().toISOString(),
+    },
+  });
+}
+
+// Silently drops any axis with an unrecognised value instead of storing
+// model/client-supplied garbage that buildPersonalityBlock would then have
+// to guard against at template time.
+export async function setPersonality(userId, personality) {
+  const clean = { ...DEFAULT_PERSONALITY };
+  for (const axis of Object.keys(PERSONALITY_OPTIONS)) {
+    if (PERSONALITY_OPTIONS[axis].includes(personality?.[axis])) clean[axis] = personality[axis];
+  }
+  await updateUserMemory(userId, { personality: clean });
+}
+
+export async function markProfileReviewed(userId) {
+  await updateUserMemory(userId, { lastProfileReviewAt: new Date().toISOString() });
+}
+
+// Upsert-by-name (case-insensitive) rather than blind append, so restating
+// a person ("actually Sam is my fiancé now, not just partner") updates the
+// relation in place instead of piling on a duplicate entry.
+export async function addPerson(userId, name, relation) {
+  if (!db) return;
+  const ref = db.collection("users").doc(userId);
+  await db.runTransaction(async (tx) => {
+    const doc = await tx.get(ref);
+    const current = doc.exists && Array.isArray(doc.data().people) ? doc.data().people : [];
+    const next = current.filter((p) => String(p.name).toLowerCase() !== String(name).toLowerCase());
+    next.push({ name: String(name).slice(0, 80), relation: String(relation || "").slice(0, 40) });
+    tx.set(ref, { people: next.slice(-MAX_PEOPLE) }, { merge: true });
+  });
+}
+
+// Replaces the whole people list in one write. The setup form submits the
+// complete list at once, and calling addPerson per entry would fire N
+// concurrent transactions against the SAME document — Firestore serializes
+// those with retries, so it's slow and needlessly contentious for data that
+// is already known in full. addPerson stays for the incremental case (the
+// update_profile tool adding one person mid-conversation).
+export async function setPeople(userId, people) {
+  const clean = (Array.isArray(people) ? people : [])
+    .filter((p) => p && typeof p.name === "string" && p.name.trim())
+    .slice(0, MAX_PEOPLE)
+    .map((p) => ({
+      name: String(p.name).trim().slice(0, 80),
+      relation: String(p.relation || "").trim().slice(0, 40),
+    }));
+  await updateUserMemory(userId, { people: clean });
+}
+
+export async function removePerson(userId, name) {
+  if (!db) return false;
+  const ref = db.collection("users").doc(userId);
+  return db.runTransaction(async (tx) => {
+    const doc = await tx.get(ref);
+    if (!doc.exists) return false;
+    const current = Array.isArray(doc.data().people) ? doc.data().people : [];
+    const next = current.filter((p) => String(p.name).toLowerCase() !== String(name).toLowerCase());
+    if (next.length === current.length) return false;
+    tx.set(ref, { people: next }, { merge: true });
+    return true;
+  });
+}
+
+// Drives both mobile routing (should the setup form block home.tsx?) and the
+// in-session recheck (should Argus lead with a check-in?). A name with no
+// lastProfileReviewAt means an account that predates this feature — real
+// production data (checked 2026-08-20) showed exactly this shape: accounts
+// with a name captured incidentally via remember_preference but no
+// structured home location/people. Routing those through the short recheck
+// instead of the full interview avoids re-asking for a name that's already
+// known, and IS the migration path for pre-existing accounts — no separate
+// backfill script, since auto-parsing legacy freeform keys like
+// "child_name" into structured people would be guesswork (see e.g. this
+// same account's "conjugation assistance" entry, which isn't a person at
+// all — a heuristic that pattern-matches key names would misfire on it).
+export function computeProfileStatus(userMem) {
+  if (!userMem.lastProfileReviewAt) {
+    return userMem.name ? "recheck_due" : "needs_interview";
+  }
+  const daysSince = (Date.now() - new Date(userMem.lastProfileReviewAt).getTime()) / 86400000;
+  return daysSince >= RECHECK_INTERVAL_DAYS ? "recheck_due" : "ok";
+}
+
+// ============================================================
 // DAILY LOG — What happened today
 // ============================================================
 
@@ -475,26 +601,32 @@ export async function deleteUserData(userId) {
 // CONTEXT BUILDER — Compile memory into prompt context
 // ============================================================
 
-// Only name/dietary/allergies are auto-injected into every system
-// instruction now — small, bounded, and safety/latency-critical enough that
-// the model shouldn't need a tool round-trip to know about them mid-turn.
-// The general `preferences` map, shopping list, and recent observations used
-// to be dumped in here too (unbounded, and — per production data pulled
+// Name/home location/people/dietary/allergies are auto-injected into every
+// system instruction — small, bounded, and safety/latency-critical (or, for
+// the profile fields, identity-critical) enough that the model shouldn't
+// need a tool round-trip to know about them mid-turn. The general
+// `preferences` map, shopping list, and recent observations used to be
+// dumped in here too (unbounded, and — per production data pulled
 // 2026-08-08 — never actually triggered a bloated prompt since no account
 // had lived long enough to accumulate any). They're still fully available
 // on demand via the recall_memory tool; front-loading them was pure
 // duplication of a capability the model already had.
 // Hard ceiling on anything user-derived that reaches the system instruction.
-// Measured 2026-08-09 against live Firestore: the largest real account
-// contributes 22 characters, so this is headroom, not a squeeze — its job is
-// to guarantee the instruction can never grow with usage, which is the
-// property that was missing rather than a size problem that existed.
-const MAX_INJECTED_CHARS = 600;
+// Raised 600 -> 900 when home location/people were added — still headroom
+// (measured 2026-08-09 pre-profile: the largest real account contributed 22
+// characters), not a squeeze; its job is to guarantee the instruction can
+// never grow with usage, which is the property that was missing rather than
+// a size problem that existed.
+const MAX_INJECTED_CHARS = 900;
 
 function clamp(str, max) {
   return str.length <= max ? str : str.slice(0, max - 1) + "…";
 }
 
+// Returns { text, personality, profileStatus, homeCity } rather than a bare
+// string now that buildSystemInstruction needs more than prose out of this:
+// personality drives its own template section (not a fact dumped into
+// prose), and profileStatus/homeCity drive the conditional recheck block.
 export async function buildMemoryContext(userId = "default") {
   const [userMem, dailyLog] = await Promise.all([
     getUserMemory(userId),
@@ -504,6 +636,14 @@ export async function buildMemoryContext(userId = "default") {
   let context = "";
 
   if (userMem.name) context += `User's name: ${clamp(String(userMem.name), 80)}. `;
+  if (userMem.homeLocation && userMem.homeLocation.city) {
+    context += `Home: ${clamp(String(userMem.homeLocation.city), 100)}. `;
+  }
+  const people = Array.isArray(userMem.people) ? userMem.people : [];
+  if (people.length) {
+    const list = people.map((p) => `${p.name}${p.relation ? ` (${p.relation})` : ""}`).join(", ");
+    context += `Important people: ${clamp(list, 300)}. `;
+  }
   const dietary = asList(userMem.dietaryPreferences);
   if (dietary.length) context += `Dietary preferences: ${clamp(dietary.join(", "), 200)}. `;
   const allergies = asList(userMem.allergies);
@@ -515,5 +655,11 @@ export async function buildMemoryContext(userId = "default") {
     context += `\n\nToday so far: ${clamp(summary, 400)}. `;
   }
 
-  return clamp(context, MAX_INJECTED_CHARS);
+  return {
+    text: clamp(context, MAX_INJECTED_CHARS),
+    personality: { ...DEFAULT_PERSONALITY, ...(userMem.personality || {}) },
+    profileStatus: computeProfileStatus(userMem),
+    homeCity: (userMem.homeLocation && userMem.homeLocation.city) || null,
+    homeLocation: userMem.homeLocation || null,
+  };
 }

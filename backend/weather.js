@@ -59,6 +59,53 @@ export async function getWeather(
   }
 }
 
+// Resolves a free-text city ("Milwaukee, Wisconsin") to coordinates via
+// Open-Meteo's geocoding API — same provider as the forecast above, no API
+// key, so this adds no new dependency or credential. Cached indefinitely
+// per query string: a city's coordinates don't change, and the input space
+// is tiny (one per user, set at setup or when they move).
+//
+// Home coordinates matter because IP geolocation only ever says where the
+// user is *right now*. Storing home separately is what lets Argus tell
+// "you're home" from "you're travelling" (see buildSystemInstruction).
+const geocodeCache = new Map();
+
+export async function geocodeCity(city) {
+  const key = String(city || "").trim().toLowerCase();
+  if (!key) return null;
+  if (geocodeCache.has(key)) return geocodeCache.get(key);
+  try {
+    const url = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(city)}&count=1&format=json`;
+    const resp = await fetch(url, { signal: AbortSignal.timeout(3000) });
+    const data = await resp.json();
+    const hit = data && data.results && data.results[0];
+    if (!hit) return null;
+    const lat = Number(hit.latitude), lon = Number(hit.longitude);
+    // Same validation shape as the IP-geo path in server.js — never let an
+    // unvalidated coordinate reach the forecast URL.
+    if (!Number.isFinite(lat) || !Number.isFinite(lon) || Math.abs(lat) > 90 || Math.abs(lon) > 180) return null;
+    const result = { lat, lon };
+    geocodeCache.set(key, result);
+    return result;
+  } catch (err) {
+    console.warn("Geocode failed:", err.message);
+    return null;
+  }
+}
+
+// Great-circle distance in miles. Used only to decide the home/away phrasing
+// in the system instruction, so precision beyond a few miles is irrelevant.
+export function distanceMiles(lat1, lon1, lat2, lon2) {
+  const toRad = (d) => (d * Math.PI) / 180;
+  const R = 3958.8;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
 export function weatherToContext(weather) {
   if (!weather) return "";
   return `Current weather: ${weather.temperature}°F, ${weather.condition}. High ${weather.high}°F / Low ${weather.low}°F. Wind ${weather.windSpeed} mph. Sunset at ${weather.sunset}. Tomorrow: ${weather.tomorrowHigh}°F, ${weather.tomorrowCondition}.`;
