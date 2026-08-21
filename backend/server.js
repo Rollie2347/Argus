@@ -602,6 +602,16 @@ wss.on("connection", async (clientWs, req) => {
 
             if (msg.serverContent && msg.serverContent.interrupted) {
               console.log("⚡ Gemini interrupted its own response (barge-in)");
+              // Tell the client to drop whatever it has buffered. Gemini stops
+              // generating the moment it detects barge-in, but chunks already
+              // forwarded are sitting in the client's playback queue — without
+              // this the client finishes speaking the abandoned response and
+              // then plays the replacement on top of it, which is audible as
+              // Argus talking over itself and repeating (reported on build 41).
+              // The client's stopPlayback() already clears the queue and
+              // invalidates the in-flight playback token; it just had no way
+              // to know an interruption had happened.
+              clientWs.send(JSON.stringify({ type: "interrupted" }));
             }
 
             // Handle tool calls from Gemini

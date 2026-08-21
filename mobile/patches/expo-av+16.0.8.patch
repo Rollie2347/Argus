@@ -20,7 +20,7 @@ diff --git a/node_modules/expo-av/ios/EXAV/EXAudioSessionManager.m b/node_module
 index 3e768d1..ba86ece 100644
 --- a/node_modules/expo-av/ios/EXAV/EXAudioSessionManager.m
 +++ b/node_modules/expo-av/ios/EXAV/EXAudioSessionManager.m
-@@ -247,10 +247,18 @@ EX_REGISTER_SINGLETON_MODULE(AudioSessionManager);
+@@ -247,10 +247,22 @@ EX_REGISTER_SINGLETON_MODULE(AudioSessionManager);
      return error;
    }
 
@@ -28,14 +28,18 @@ index 3e768d1..ba86ece 100644
      [session setActive:YES error:&error];
      if (!error) {
        _sessionIsActive = YES;
-+      // DefaultToSpeaker (above) is only a hint for the *default* route choice — reports of it
-+      // not reliably taking effect (route silently staying on the quiet earpiece receiver) are
-+      // common enough not to trust passively. Actively force the point instead of hoping the
-+      // category option alone is enough. Not fatal if it fails — session is active either way.
-+      if ([category isEqualToString:AVAudioSessionCategoryPlayAndRecord]) {
-+        NSError *overrideError;
-+        [session overrideOutputAudioPort:AVAudioSessionPortOverrideSpeaker error:&overrideError];
-+      }
      }
    }
++
++  // Re-assert the speaker route on EVERY configuration pass, not just on the
++  // inactive->active transition. The session stays active across recording
++  // cycles, so once _sessionIsActive is YES that branch never runs again —
++  // but each setCategory: resets the output route back to the .playAndRecord
++  // default (the earpiece receiver), which is quiet AND sounds muffled. That
++  // is why raising AUDIO_GAIN 1.6 -> 3.2 -> 5.0 never fixed the complaint:
++  // wrong transducer, not wrong level. Not fatal if it fails.
++  if (_sessionIsActive && [category isEqualToString:AVAudioSessionCategoryPlayAndRecord]) {
++    NSError *overrideError;
++    [session overrideOutputAudioPort:AVAudioSessionPortOverrideSpeaker error:&overrideError];
++  }
 

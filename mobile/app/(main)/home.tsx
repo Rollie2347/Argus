@@ -199,6 +199,11 @@ export default function Home() {
     else if (msg.type === "text") { addLine(msg.data, "argus"); setStatus("observing"); clearToolStatus(); }
     else if (msg.type === "tool_event") showToolStatus(TOOL_LABELS[msg.tool] || msg.tool);
     else if (msg.type === "audio") { setStatus("speaking"); enqueueAudio(msg.data); }
+    // Gemini abandoned the response it was generating (barge-in). Anything
+    // still queued belongs to that abandoned turn, so playing it would talk
+    // over — and then repeat ahead of — the replacement response that's about
+    // to arrive. Drop it rather than draining it.
+    else if (msg.type === "interrupted") { stopPlayback(); setStatus("observing"); }
     else if (msg.type === "turn_complete") { setStatus("observing"); clearToolStatus(); }
     else if (msg.type === "disconnected") {
       // Reaching here means the backend genuinely dropped the connection —
