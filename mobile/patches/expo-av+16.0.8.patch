@@ -14,30 +14,16 @@ index 7153d28..5e7da86 100644
 +    // accessory is active; those still take priority automatically.
 +    requiredAudioCategoryOptions = requiredAudioCategoryOptions | AVAudioSessionCategoryOptionDefaultToSpeaker;
    }
-   
+
    return [_kernelAudioSessionManagerDelegate setCategory:requiredAudioCategory withOptions:requiredAudioCategoryOptions forModule:self];
 diff --git a/node_modules/expo-av/ios/EXAV/EXAudioSessionManager.m b/node_modules/expo-av/ios/EXAV/EXAudioSessionManager.m
 index 3e768d1..ba86ece 100644
 --- a/node_modules/expo-av/ios/EXAV/EXAudioSessionManager.m
 +++ b/node_modules/expo-av/ios/EXAV/EXAudioSessionManager.m
-@@ -247,10 +247,32 @@ EX_REGISTER_SINGLETON_MODULE(AudioSessionManager);
+@@ -247,10 +247,18 @@ EX_REGISTER_SINGLETON_MODULE(AudioSessionManager);
      return error;
    }
- 
-+  // AVAudioSessionModeDefault (never overridden anywhere in this file) gives
-+  // PlayAndRecord none of iOS's tuned acoustic echo cancellation for
-+  // simultaneous record+playback — VoiceChat is what actually engages AEC.
-+  // Needed now that DefaultToSpeaker (above) routes output to the loud
-+  // built-in speaker instead of the earpiece: without AEC the mic picks up
-+  // enough of that speaker output to make Gemini's VAD treat it as the user
-+  // interrupting, mid-response, over and over.
-+  if ([category isEqualToString:AVAudioSessionCategoryPlayAndRecord] && ![session.mode isEqualToString:AVAudioSessionModeVoiceChat]) {
-+    [session setMode:AVAudioSessionModeVoiceChat error:&error];
-+    if (error) {
-+      return error;
-+    }
-+  }
-+
+
    if (shouldBeActive && !_sessionIsActive) {
      [session setActive:YES error:&error];
      if (!error) {
@@ -52,4 +38,4 @@ index 3e768d1..ba86ece 100644
 +      }
      }
    }
- 
+
