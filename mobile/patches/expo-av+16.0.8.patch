@@ -20,7 +20,7 @@ diff --git a/node_modules/expo-av/ios/EXAV/EXAudioSessionManager.m b/node_module
 index 3e768d1..ba86ece 100644
 --- a/node_modules/expo-av/ios/EXAV/EXAudioSessionManager.m
 +++ b/node_modules/expo-av/ios/EXAV/EXAudioSessionManager.m
-@@ -247,9 +247,34 @@ EX_REGISTER_SINGLETON_MODULE(AudioSessionManager);
+@@ -247,9 +247,47 @@ EX_REGISTER_SINGLETON_MODULE(AudioSessionManager);
      return error;
    }
 
@@ -30,6 +30,19 @@ index 3e768d1..ba86ece 100644
        _sessionIsActive = YES;
      }
    }
++
++  // expo-av never calls setPreferredSampleRate:, so iOS picks the default
++  // for a .playAndRecord session — which it treats as a telephony-grade
++  // route and commonly clamps to 16 kHz (sometimes 8 kHz). Gemini's audio is
++  // 24 kHz and the audio probe measured 10.1% of its energy above 8 kHz, so
++  // a 16 kHz session silently discards that entire band. That is the
++  // "muffled" complaint: confirmed 2026-08-21 by playing the exact same
++  // captured WAV through Safari (clear, .playback category) and through
++  // Argus (muffled, .playAndRecord) on the same device and speaker.
++  // Requesting 48 kHz is a preference, not a guarantee — iOS may still
++  // refuse under some routes — hence non-fatal handling.
++  NSError *rateError;
++  [session setPreferredSampleRate:48000 error:&rateError];
 +
 +  // VoiceChat mode is what actually engages iOS acoustic echo cancellation
 +  // for simultaneous record+playback; AVAudioSessionModeDefault (expo-av's
