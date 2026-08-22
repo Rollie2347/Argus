@@ -20,7 +20,7 @@ diff --git a/node_modules/expo-av/ios/EXAV/EXAudioSessionManager.m b/node_module
 index 3e768d1..ba86ece 100644
 --- a/node_modules/expo-av/ios/EXAV/EXAudioSessionManager.m
 +++ b/node_modules/expo-av/ios/EXAV/EXAudioSessionManager.m
-@@ -247,10 +247,22 @@ EX_REGISTER_SINGLETON_MODULE(AudioSessionManager);
+@@ -247,9 +247,34 @@ EX_REGISTER_SINGLETON_MODULE(AudioSessionManager);
      return error;
    }
 
@@ -31,15 +31,27 @@ index 3e768d1..ba86ece 100644
      }
    }
 +
++  // VoiceChat mode is what actually engages iOS acoustic echo cancellation
++  // for simultaneous record+playback; AVAudioSessionModeDefault (expo-av's
++  // unchanged behaviour) gets none of it. Restored after build 42 shipped a
++  // genuinely-working speaker route WITHOUT AEC and made self-interruption
++  // markedly worse — a loud speaker feeding the mic is exactly what Gemini's
++  // VAD reads as the user barging in. Build 41 removed VoiceChat to test it
++  // as the muffling cause and exonerated it (still muffled without it), so
++  // there is no longer a reason to trade AEC away.
++  if ([category isEqualToString:AVAudioSessionCategoryPlayAndRecord] && ![session.mode isEqualToString:AVAudioSessionModeVoiceChat]) {
++    [session setMode:AVAudioSessionModeVoiceChat error:&error];
++    if (error) {
++      return error;
++    }
++  }
++
 +  // Re-assert the speaker route on EVERY configuration pass, not just on the
 +  // inactive->active transition. The session stays active across recording
 +  // cycles, so once _sessionIsActive is YES that branch never runs again —
 +  // but each setCategory: resets the output route back to the .playAndRecord
-+  // default (the earpiece receiver), which is quiet AND sounds muffled. That
-+  // is why raising AUDIO_GAIN 1.6 -> 3.2 -> 5.0 never fixed the complaint:
-+  // wrong transducer, not wrong level. Not fatal if it fails.
++  // default (the earpiece receiver), which is quiet. Not fatal if it fails.
 +  if (_sessionIsActive && [category isEqualToString:AVAudioSessionCategoryPlayAndRecord]) {
 +    NSError *overrideError;
 +    [session overrideOutputAudioPort:AVAudioSessionPortOverrideSpeaker error:&overrideError];
 +  }
-
