@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Argus Audio Diagnostic</title>
+<style>
+  body { background:#08080c; color:#e8e0d0; font-family:-apple-system,system-ui,sans-serif; padding:24px; line-height:1.5; }
+  h1 { color:#c9a84c; font-size:20px; }
+  .card { border:1px solid #2a2a36; border-radius:6px; padding:16px; margin:16px 0; }
+  button { background:#c9a84c; color:#08080c; border:0; border-radius:4px; padding:14px 18px; font-size:16px; font-weight:600; width:100%; margin-top:10px; }
+  button:disabled { opacity:.4; }
+  .rate { font-size:32px; color:#c9a84c; font-weight:700; }
+  .label { color:#9e978a; font-size:13px; }
+  .verdict { padding:14px; border-radius:4px; margin-top:14px; font-weight:600; }
+  .bad { background:#4a1f1a; color:#ff9c8f; }
+  .good { background:#1c3a24; color:#8fe6a4; }
+  code { color:#c9a84c; }
+</style>
+</head>
+<body>
+<h1>Argus Audio Diagnostic</h1>
+<p class="label">
+Measures whether iOS reduces the audio hardware sample rate when the microphone
+becomes active. Argus must hold the mic and the speaker at the same time
+(<code>.playAndRecord</code>); Safari playing a file normally does not. If the rate
+drops when the mic turns on, every frequency above half that rate is discarded —
+which is what "muffled" means.
+</p>
+
+<div class="card">
+  <div class="label">Sample rate — playback only (no microphone)</div>
+  <div class="rate" id="before">—</div>
+  <button id="b1">1. Measure &amp; play without mic</button>
+</div>
+
+<div class="card">
+  <div class="label">Sample rate — while microphone is active</div>
+  <div class="rate" id="after">—</div>
+  <button id="b2" disabled>2. Enable mic, then measure &amp; play</button>
+</div>
+
+<div id="verdict"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+let micStream = null;
+
+function play(url) {
+  const a = new Audio(url);
+  a.play().catch(e => alert("Playback failed: " + e.message));
+  return a;
+}
+
+$("b1").onclick = async () => {
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  await ctx.resume();
+  $("before").textContent = ctx.sampleRate + " Hz";
+  $("before").dataset.v = ctx.sampleRate;
+  play("/reference-audio.wav");
+  $("b2").disabled = false;
+  ctx.close();
+};
+
+$("b2").onclick = async () => {
+  try {
+    // Holding the mic is what pushes iOS into the record-capable session
+    // category. This mirrors what Argus does; a plain <audio> element does not.
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (e) {
+    alert("Mic permission needed for this test: " + e.message);
+    return;
+  }
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  await ctx.resume();
+  const rate = ctx.sampleRate;
+  $("after").textContent = rate + " Hz";
+
+  play("/reference-audio.wav");
+
+  const before = parseFloat($("before").dataset.v || "0");
+  const v = $("verdict");
+  if (before && rate < before) {
+    v.className = "verdict bad";
+    v.innerHTML = "CONFIRMED: rate dropped " + before + " Hz &rarr; " + rate +
+      " Hz when the mic engaged. Everything above " + Math.round(rate / 2) +
+      " Hz is being discarded. This is the muffling, and it is an OS-level" +
+      " consequence of holding the mic — not something app-side gain or" +
+      " playback code can undo.";
+  } else if (before) {
+    v.className = "verdict good";
+    v.innerHTML = "Rate did NOT drop (" + before + " Hz &rarr; " + rate +
+      " Hz). Sample-rate clamping is ruled out — if audio still sounds muffled" +
+      " with the mic on, the cause is elsewhere.";
+  }
+  // Keep the mic open during playback; releasing it would let iOS restore the
+  // media route mid-test and invalidate the comparison.
+  setTimeout(() => { micStream.getTracks().forEach(t => t.stop()); ctx.close(); }, 8000);
+};
+</script>
+</body>
+</html>
