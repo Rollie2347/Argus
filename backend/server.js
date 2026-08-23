@@ -382,7 +382,12 @@ wss.on("connection", async (clientWs, req) => {
   // Fleet-wide capacity check — must happen after auth (an unauthenticated
   // connection should never consume a slot) and before opening the billed
   // Gemini session below.
+  // Sharded counter: 10 Firestore shard reads plus a transactional write, all
+  // in the connection-open path. Measured rather than assumed, because it is
+  // the single largest Firestore operation Argus performs.
+  const slotStart = Date.now();
   const slot = await reserveGlobalSlot(MAX_GLOBAL_CONCURRENT_SESSIONS);
+  console.log(`⏱️ reserveGlobalSlot: ${Date.now() - slotStart}ms`);
   if (!slot.allowed) {
     console.warn(`Rejected connection — at global capacity (${slot.count}/${MAX_GLOBAL_CONCURRENT_SESSIONS})`);
     clientWs.close(4029, "at capacity, try again shortly");
@@ -487,8 +492,9 @@ wss.on("connection", async (clientWs, req) => {
 
   try {
     // Build dynamic system instruction with live memory, weather + location context
+    const sysStart = Date.now();
     const systemInstruction = await buildSystemInstruction(userLat, userLon, userCity, userId);
-    console.log("📝 System instruction built with live context");
+    console.log(`📝 System instruction built with live context — ${Date.now() - sysStart}ms, ${systemInstruction.length} chars`);
 
     session = await ai.live.connect({
       model: MODEL,
@@ -622,7 +628,15 @@ wss.on("connection", async (clientWs, req) => {
 
               for (const fc of functionCalls) {
                 try {
+                  // Tool handler wall time. Most handlers are one or two
+                  // sequential Firestore round trips; the 200-user audit
+                  // ESTIMATED these at 50-150ms each and never measured one.
+                  // This sits inside the turn, so unlike the connection-open
+                  // costs it is paid again on every tool-using response and
+                  // is a real candidate for perceived slowness.
+                  const toolStart = Date.now();
                   const result = await handleToolCall(fc, userId);
+                  console.log(`⏱️ Tool ${fc.name}: ${Date.now() - toolStart}ms`);
                   functionResponses.push({
                     name: fc.name,
                     id: fc.id,

@@ -51,6 +51,16 @@ const FRAME_IDLE_AFTER_MS = 6000;
 // direct output multiplier — not comparable to the old linear numbers.
 const AUDIO_GAIN = 5.0;
 const CONNECT_TIMEOUT_MS = 12000;
+// Barge-in cuts playback off wherever it happens to be, which lands mid-word
+// and reads as Argus glitching rather than yielding. Backend logs bear this
+// out: on the build that introduced the flush, measured barge-ins per turn
+// HALVED while the user reported it "cutting out a lot" — the rate improved
+// and each occurrence got more jarring at the same time. A short ramp is the
+// difference between a click and a natural trail-off. Kept well under the
+// ~100-300ms it takes the replacement burst to load and start, so the fade
+// costs no added latency and cannot overlap the next response.
+const FADE_MS = 120;
+const FADE_STEPS = 6;
 
 const TOOL_LABELS: Record<string, string> = {
   identify_scene: "Looking at what's around you",
@@ -203,7 +213,7 @@ export default function Home() {
     // still queued belongs to that abandoned turn, so playing it would talk
     // over — and then repeat ahead of — the replacement response that's about
     // to arrive. Drop it rather than draining it.
-    else if (msg.type === "interrupted") { stopPlayback(); setStatus("observing"); }
+    else if (msg.type === "interrupted") { stopPlayback({ fade: true }); setStatus("observing"); }
     else if (msg.type === "turn_complete") { setStatus("observing"); clearToolStatus(); }
     else if (msg.type === "disconnected") {
       // Reaching here means the backend genuinely dropped the connection —
@@ -406,13 +416,36 @@ export default function Home() {
     }
   }
 
-  function stopPlayback() {
+  // Ramps a sound down before unloading it. Detached from soundRef by the
+  // caller first, so it owns this sound outright and a newer burst can take
+  // over soundRef immediately without waiting on the ramp.
+  function fadeOutAndUnload(sound: Audio.Sound) {
+    (async () => {
+      try {
+        for (let i = FADE_STEPS - 1; i >= 0; i--) {
+          await sound.setVolumeAsync(i / FADE_STEPS);
+          await new Promise(r => setTimeout(r, FADE_MS / FADE_STEPS));
+        }
+      } catch { /* sound already gone — unload below is still safe */ }
+      try { await sound.unloadAsync(); } catch {}
+    })();
+  }
+
+  // fade is for barge-in, where the audio is being abandoned mid-sentence and
+  // a hard cut is audible as a click. Teardown paths (disconnect, screen exit,
+  // superseded session) pass nothing and stop instantly — there is no one left
+  // to hear a graceful ending, and a 120ms tail would outlive the session.
+  function stopPlayback(opts?: { fade?: boolean }) {
     // Invalidates any burst currently mid-load so it unloads itself instead of
     // starting playback after this call.
     playbackTokenRef.current++;
     audioQueueRef.current = [];
     isPlayingRef.current = false;
-    if (soundRef.current) { try { soundRef.current.unloadAsync(); } catch {} soundRef.current = null; }
+    const snd = soundRef.current;
+    soundRef.current = null;
+    if (!snd) return;
+    if (opts?.fade) fadeOutAndUnload(snd);
+    else { try { snd.unloadAsync(); } catch {} }
   }
 
   useEffect(() => {

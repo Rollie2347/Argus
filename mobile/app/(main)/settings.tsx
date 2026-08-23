@@ -80,6 +80,14 @@ export default function Settings() {
           </View>
         )}
 
+        <TouchableOpacity style={s.row} onPress={() => router.push("/(main)/audio-test")}>
+          <View style={{ flex: 1 }}>
+            <Text style={s.rowLabel}>Audio A/B test</Text>
+            <Text style={s.rowSub}>Plays one reference clip under each audio configuration, to find which one muffles it</Text>
+          </View>
+          <Text style={s.rowChevron}>›</Text>
+        </TouchableOpacity>
+
         <TouchableOpacity style={s.row} onPress={() => Linking.openURL(`${BACKEND}/privacy`)}>
           <View style={{ flex: 1 }}>
             <Text style={s.rowLabel}>Privacy Policy</Text>

@@ -14,23 +14,16 @@ index 7153d28..5e7da86 100644
 +    // accessory is active; those still take priority automatically.
 +    requiredAudioCategoryOptions = requiredAudioCategoryOptions | AVAudioSessionCategoryOptionDefaultToSpeaker;
    }
-
+   
    return [_kernelAudioSessionManagerDelegate setCategory:requiredAudioCategory withOptions:requiredAudioCategoryOptions forModule:self];
 diff --git a/node_modules/expo-av/ios/EXAV/EXAudioSessionManager.m b/node_modules/expo-av/ios/EXAV/EXAudioSessionManager.m
-index 3e768d1..ba86ece 100644
+index 3e768d1..4283b69 100644
 --- a/node_modules/expo-av/ios/EXAV/EXAudioSessionManager.m
 +++ b/node_modules/expo-av/ios/EXAV/EXAudioSessionManager.m
-@@ -247,9 +247,47 @@ EX_REGISTER_SINGLETON_MODULE(AudioSessionManager);
-     return error;
-   }
-
-   if (shouldBeActive && !_sessionIsActive) {
-     [session setActive:YES error:&error];
-     if (!error) {
-       _sessionIsActive = YES;
+@@ -254,6 +254,60 @@ EX_REGISTER_SINGLETON_MODULE(AudioSessionManager);
      }
    }
-+
+ 
 +  // expo-av never calls setPreferredSampleRate:, so iOS picks the default
 +  // for a .playAndRecord session — which it treats as a telephony-grade
 +  // route and commonly clamps to 16 kHz (sometimes 8 kHz). Gemini's audio is
@@ -58,6 +51,22 @@ index 3e768d1..ba86ece 100644
 +      return error;
 +    }
 +  }
++  // ...and put the mode BACK when the category is not .playAndRecord. Without
++  // this the session keeps VoiceChat mode after switching to .playback, so the
++  // voice-processing I/O chain — and the speech-shaped output EQ that comes
++  // with it — stays engaged even when nothing is recording. Two consequences:
++  // (1) turning the mic off could never have restored full-bandwidth playback,
++  // so it was useless as a test, and (2) build 41's "removed VoiceChat, still
++  // muffled" result did not actually clear VoiceChat of causing the muffling,
++  // because that build also predated the overrideOutputAudioPort fix and was
++  // still routing to the earpiece receiver. Mode is a session-wide sticky
++  // setting; it has to be unwound explicitly, exactly like the route override.
++  else if (![category isEqualToString:AVAudioSessionCategoryPlayAndRecord] && ![session.mode isEqualToString:AVAudioSessionModeDefault]) {
++    [session setMode:AVAudioSessionModeDefault error:&error];
++    if (error) {
++      return error;
++    }
++  }
 +
 +  // Re-assert the speaker route on EVERY configuration pass, not just on the
 +  // inactive->active transition. The session stays active across recording
@@ -68,3 +77,7 @@ index 3e768d1..ba86ece 100644
 +    NSError *overrideError;
 +    [session overrideOutputAudioPort:AVAudioSessionPortOverrideSpeaker error:&overrideError];
 +  }
++
+   if (error) {
+     return error;
+   }
