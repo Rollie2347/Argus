@@ -3,6 +3,7 @@ import { View, Text, TouchableOpacity, StyleSheet, SafeAreaView, ScrollView } fr
 import { Audio } from "expo-av";
 import { router } from "expo-router";
 import { BACKEND } from "../../services/websocket";
+import { pcmChunksToWavBase64, DEFAULT_GAIN } from "../../services/audioGain";
 
 /**
  * Audio A/B harness.
@@ -108,13 +109,8 @@ export default function AudioTest() {
     await playAndWait(REF_URL);
   });
 
-  // B — same category, but no live input. Isolates "is it the recording
-  // itself" from "is it the category/mode".
-  const testB = () => run("B", async () => {
-    await Audio.setAudioModeAsync({ allowsRecordingIOS: true, playsInSilentModeIOS: true });
-    note("B", "playAndRecord + VoiceChat, mic idle");
-    await playAndWait(REF_URL);
-  });
+  // Round 1's test B (same category, mic idle) is dropped — A and B both came
+  // back clear, so "is it the live recording" is already answered.
 
   // C — the Safari-equivalent configuration. With the mode-reset fix in
   // patches/expo-av+16.0.8.patch this now genuinely lands on .playback +
@@ -139,11 +135,35 @@ export default function AudioTest() {
     await playAndWait(`data:audio/wav;base64,${btoa(bin)}`);
   });
 
+  // Round 2. Tests A-D all came back CLEAR while the real app was still
+  // muffled, which exonerated the audio session and the decode path entirely —
+  // and exposed the flaw in round 1: the reference clip was played untouched,
+  // while real playback runs every sample through the gain transform first.
+  // The gain was the one variable the harness held constant. These play the
+  // SAME clip through the SAME code path real playback uses, varying only the
+  // gain, so whichever one sounds clean is the value to ship.
+  const gainTest = (gain: number) => () => run(`G${gain}`, async () => {
+    await Audio.setAudioModeAsync({ allowsRecordingIOS: true, playsInSilentModeIOS: true });
+    await startDummyRecording();
+    const res = await fetch(REF_URL);
+    const raw = new Uint8Array(await res.arrayBuffer());
+    // Strip the 44-byte WAV header to recover the PCM, then re-wrap it exactly
+    // the way a live response is wrapped.
+    let pcmBin = "";
+    for (let i = 44; i < raw.length; i++) pcmBin += String.fromCharCode(raw[i]);
+    const wav = pcmChunksToWavBase64([btoa(pcmBin)], 24000, gain);
+    note(`gain ${gain}`, gain === 5.0 ? "the old value — expected muffled" : gain === DEFAULT_GAIN ? "the new default" : "");
+    await playAndWait(`data:audio/wav;base64,${wav}`);
+  });
+
   const TESTS = [
-    { id: "A", title: "A — Mic session, mic live", sub: "What a real Argus session sounds like today", fn: testA },
-    { id: "B", title: "B — Mic session, mic idle", sub: "Same category/mode, nothing recording", fn: testB },
-    { id: "C", title: "C — Playback session", sub: "Safari-equivalent. Expected clear.", fn: testC },
-    { id: "D", title: "D — Playback session, data: URI", sub: "Same as C through expo-av's decode path", fn: testD },
+    { id: "G1", title: "1 — Gain 1.0 (untouched)", sub: "No gain at all. The cleanest possible reference.", fn: gainTest(1.0) },
+    { id: `G${DEFAULT_GAIN}`, title: `2 — Gain ${DEFAULT_GAIN} (new default)`, sub: "Near-unity, dynamics preserved. Should sound like #1 but a touch louder.", fn: gainTest(DEFAULT_GAIN) },
+    { id: "G1.5", title: "3 — Gain 1.5", sub: "Louder still, slight peak limiting. Use if 2 is too quiet.", fn: gainTest(1.5) },
+    { id: "G5", title: "4 — Gain 5.0 (what shipped)", sub: "The old value. If this is the muffling, it will be obvious here.", fn: gainTest(5.0) },
+    { id: "A", title: "A — Mic session, mic live", sub: "Round 1 control, no gain. Came back clear.", fn: testA },
+    { id: "C", title: "C — Playback session", sub: "Round 1 control, no gain. Came back clear.", fn: testC },
+    { id: "D", title: "D — Playback session, data: URI", sub: "Round 1 control, no gain. Came back clear.", fn: testD },
   ];
 
   return (
@@ -155,9 +175,10 @@ export default function AudioTest() {
       </View>
       <ScrollView contentContainerStyle={{ paddingBottom: 40 }}>
         <Text style={s.intro}>
-          Each test plays the same reference clip. Run them in order and note which
-          ones sound muffled and which sound clear — the first one that sounds clear
-          tells us exactly which part of the playback path is responsible.
+          Tests 1-4 play the same clip at different playback gains, through the exact
+          code a live response goes through. Pick the loudest one that still sounds
+          clean — that is the value that ships. A/C/D below are the round-1 controls
+          and should all still sound clear.
         </Text>
         {TESTS.map((t) => (
           <TouchableOpacity

@@ -6,6 +6,7 @@ import { router } from "expo-router";
 import { getStoredUser, signOut, deleteAccount } from "../../services/auth";
 import { ArgusSocket } from "../../services/websocket";
 import { useCaptions } from "../../contexts/CaptionsContext";
+import { pcmChunksToWavBase64 } from "../../services/audioGain";
 import type { User } from "../../services/auth";
 
 type Status = "dormant"|"connecting"|"observing"|"speaking"|"error";
@@ -37,19 +38,6 @@ const FRAME_MS_IDLE = 5000;
 // counts as active. One full turn (speak → respond) keeps traffic flowing well
 // inside this, so the cadence only drops during real lulls.
 const FRAME_IDLE_AFTER_MS = 6000;
-// Was a hard-clamped linear multiplier (1.6 -> 2.4 -> 3.2 -> 4.5 across four
-// rounds), still reported quiet even at 4.5. Switched to a tanh soft-clip
-// (see the boost loop below) instead of pushing the linear value even
-// higher: a hard clamp only affects samples that already exceed the
-// ceiling, so most of a real speech waveform (which has real headroom above
-// its RMS level) was passing through unclipped and just... quiet, while the
-// loudest peaks were flat-topping into harsh, odd-harmonic-heavy distortion
-// — a real candidate for what read as "muffled," separate from the
-// AVAudioSessionModeVoiceChat bandwidth theory. tanh saturates smoothly
-// instead of flat-topping, so this gain can run meaningfully hotter for the
-// same (or better) distortion character. Value is inside the tanh, not a
-// direct output multiplier — not comparable to the old linear numbers.
-const AUDIO_GAIN = 5.0;
 const CONNECT_TIMEOUT_MS = 12000;
 // Barge-in cuts playback off wherever it happens to be, which lands mid-word
 // and reads as Argus glitching rather than yielding. Backend logs bear this
@@ -83,55 +71,6 @@ async function getAudioB64(uri: string): Promise<string> {
   const r = await fetch(uri);
   const buf = await r.arrayBuffer();
   const bytes = new Uint8Array(buf);
-  let bin = "";
-  bytes.forEach(b => bin += String.fromCharCode(b));
-  return btoa(bin);
-}
-
-// Gemini sends raw PCM16 mono @ 24kHz in many small chunks; expo-av can only
-// load audio files/URIs, not append to an already-playing one, so each
-// playable unit needs its own WAV header. Chunks are merged (see
-// pcmChunksToWavBase64) before wrapping instead of wrapping one at a time, to
-// avoid a Sound-object load/gap at every chunk boundary.
-function pcmChunksToWavBase64(pcmB64Chunks: string[], sampleRate: number): string {
-  const pcmBins = pcmB64Chunks.map(atob);
-  const pcmLen = pcmBins.reduce((sum, bin) => sum + bin.length, 0);
-  const headerLen = 44;
-  const buf = new ArrayBuffer(headerLen + pcmLen);
-  const view = new DataView(buf);
-  const writeStr = (offset: number, str: string) => { for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i)); };
-
-  writeStr(0, "RIFF");
-  view.setUint32(4, 36 + pcmLen, true);
-  writeStr(8, "WAVE");
-  writeStr(12, "fmt ");
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true);
-  view.setUint16(22, 1, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * 2, true);
-  view.setUint16(32, 2, true);
-  view.setUint16(34, 16, true);
-  writeStr(36, "data");
-  view.setUint32(40, pcmLen, true);
-
-  const bytes = new Uint8Array(buf);
-  let offset = headerLen;
-  for (const bin of pcmBins) {
-    for (let i = 0; i < bin.length; i++) bytes[offset + i] = bin.charCodeAt(i);
-    offset += bin.length;
-  }
-  // Gemini's output level plus iOS's playAndRecord routing leave played-back
-  // audio quieter than expected — boost it. tanh saturates smoothly toward
-  // ±32767 instead of flat-topping there, so it's always in range with no
-  // separate clamp needed, and sounds like soft compression at the peaks
-  // rather than harsh digital clipping.
-  for (let i = headerLen; i < buf.byteLength - 1; i += 2) {
-    const sample = view.getInt16(i, true);
-    const boosted = Math.round(Math.tanh((sample / 32768) * AUDIO_GAIN) * 32767);
-    view.setInt16(i, boosted, true);
-  }
-
   let bin = "";
   bytes.forEach(b => bin += String.fromCharCode(b));
   return btoa(bin);
