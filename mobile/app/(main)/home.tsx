@@ -125,6 +125,25 @@ export default function Home() {
   // never updates for the life of the loop — mirror it in a ref so toggling
   // the mic switch actually takes effect mid-session.
   const mutedRef = useRef(false);
+  // True from the first audio chunk of a response until the turn ends. The mic
+  // keeps recording while this is set, but nothing is SENT.
+  //
+  // Why: the client streamed mic audio continuously, including through Argus's
+  // entire response, and Gemini's default activity handling is
+  // START_OF_ACTIVITY_INTERRUPTS — so any activity on that stream aborts the
+  // response in progress. Room noise, a breath, or speaker bleed was enough.
+  // Build 46 logs showed 7 turns, 7 user-speech events and 7 barge-ins: a
+  // perfect 1:1:1, every single turn interrupted exactly once. That is
+  // structural, not sporadic, which is also why halving the output gain in
+  // build 46 made the rate go UP (0.64 -> 1.00/turn) rather than down — echo
+  // loudness was never the driver.
+  //
+  // Cost, accepted deliberately: you can no longer interrupt Argus
+  // mid-sentence. Turns run ~1-4s, so the wait is short, and it buys responses
+  // that actually finish. Do NOT try to fix this with
+  // realtimeInputConfig.automaticActivityDetection instead — that field has
+  // caused an identical fatal 1007 on this model twice (see CLAUDE.md #27/#41).
+  const argusSpeakingRef = useRef(false);
   const audioStartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const playbackTokenRef = useRef(0);
 
@@ -147,13 +166,13 @@ export default function Home() {
     if (msg.type === "connected") { clearConnectTimeout(); setStatus("observing"); }
     else if (msg.type === "text") { addLine(msg.data, "argus"); setStatus("observing"); clearToolStatus(); }
     else if (msg.type === "tool_event") showToolStatus(TOOL_LABELS[msg.tool] || msg.tool);
-    else if (msg.type === "audio") { setStatus("speaking"); enqueueAudio(msg.data); }
+    else if (msg.type === "audio") { argusSpeakingRef.current = true; setStatus("speaking"); enqueueAudio(msg.data); }
     // Gemini abandoned the response it was generating (barge-in). Anything
     // still queued belongs to that abandoned turn, so playing it would talk
     // over — and then repeat ahead of — the replacement response that's about
     // to arrive. Drop it rather than draining it.
-    else if (msg.type === "interrupted") { stopPlayback({ fade: true }); setStatus("observing"); }
-    else if (msg.type === "turn_complete") { setStatus("observing"); clearToolStatus(); }
+    else if (msg.type === "interrupted") { argusSpeakingRef.current = false; stopPlayback({ fade: true }); setStatus("observing"); }
+    else if (msg.type === "turn_complete") { argusSpeakingRef.current = false; setStatus("observing"); clearToolStatus(); }
     else if (msg.type === "disconnected") {
       // Reaching here means the backend genuinely dropped the connection —
       // a user-initiated teardown goes through disconnect() and never emits
@@ -235,12 +254,19 @@ export default function Home() {
           // back up immediately instead of sitting idle through a network
           // round trip — that wait was the dominant chunk of dead-air in
           // each recording cycle and was audible as cutting in and out.
-          if (uri) {
+          // Drop the chunk entirely while Argus is speaking (see
+          // argusSpeakingRef). Checked again after the encode as well as
+          // before it, because a response can begin during the round trip and
+          // a chunk landing then is exactly what aborts it. Skipping the
+          // encode also keeps that work off the CPU, which is the binding
+          // Cloud Run constraint on the other end.
+          if (uri && !argusSpeakingRef.current) {
             // Re-read the current socket at send time rather than sending to a
             // captured one: a captured socket could still be OPEN after the app
             // moved to a new session, delivering this chunk into the old Gemini
             // session, whose reply then played over the live session's audio.
             getAudioB64(uri).then(b64 => {
+              if (argusSpeakingRef.current) return;
               if (epochRef.current === myEpoch && socketRef.current?.ready) socketRef.current.sendAudio(b64);
             }).catch(() => {});
           }

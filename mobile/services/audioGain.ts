@@ -35,7 +35,13 @@
  * the top of the range.
  */
 
-export const DEFAULT_GAIN = 1.15;
+// 1.5, chosen on-device: build 46's harness played 1.0 / 1.15 / 1.5 / 5.0 and
+// this was the loudest that still sounded clean. It also confirmed the
+// diagnosis — 5.0 was picked out as the muffled one, unprompted.
+// Against the real capture this keeps crest factor at 5.11 (raw is 6.49) for
+// +3.5 dB, with 0.21% of samples above 90% of full scale. Compare the old 5.0:
+// crest 2.35, +10.2 dB, 4.76%.
+export const DEFAULT_GAIN = 1.5;
 
 // Below this fraction of full scale the transform is exactly linear, so the
 // waveform keeps its shape and its dynamics. Only the top of the range is
