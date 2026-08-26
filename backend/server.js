@@ -646,7 +646,11 @@ wss.on("connection", async (clientWs, req) => {
                   // costs it is paid again on every tool-using response and
                   // is a real candidate for perceived slowness.
                   const toolStart = Date.now();
-                  const result = await handleToolCall(fc, userId);
+                  // Coordinates come from the same per-connection geo lookup
+                  // that feeds the system instruction. Passed explicitly
+                  // rather than held module-side — see known issue #2 for what
+                  // a shared global cost here last time.
+                  const result = await handleToolCall(fc, userId, { lat: userLat, lon: userLon, city: userCity });
                   console.log(`⏱️ Tool ${fc.name}: ${Date.now() - toolStart}ms`);
                   functionResponses.push({
                     name: fc.name,

@@ -235,6 +235,28 @@ export const TOOLS = [
         }
       },
       {
+        name: "find_places_nearby",
+        description: "Find real businesses and places near the user right now — restaurants by cuisine, cafes, bars, pharmacies, supermarkets, parks and so on. Use this for anything of the form 'is there X near me', 'where can I get Y', or 'find me an Italian place'. Returns real names, distances and addresses. Prefer this over web_search for anything location-based; web_search cannot find local businesses.",
+        parameters: {
+          type: "OBJECT",
+          properties: {
+            category: {
+              type: "STRING",
+              description: "What kind of place: restaurant, cafe, fast_food, bar, pub, pharmacy, supermarket, bakery, hospital, bank, fuel, park, hotel. Use restaurant for sit-down food.",
+            },
+            keyword: {
+              type: "STRING",
+              description: "Optional refinement matched against the cuisine and the name, e.g. 'italian', 'sushi', 'coffee'. Leave empty to get everything in the category.",
+            },
+            radius_meters: {
+              type: "NUMBER",
+              description: "How far to search. Defaults to 5000 (about 3 miles). Widen to 15000 only if a first search found nothing.",
+            },
+          },
+          required: ["category"],
+        },
+      },
+      {
         name: "get_restaurant_website",
         description: "Look up the official website for a specific restaurant.",
         parameters: {
@@ -277,7 +299,135 @@ async function lookupRestaurantWebsite(name, loc) {
   return {website:"https://www.google.com/maps/search/"+encodeURIComponent(loc?name+" "+loc:name),source:"maps_fallback"};
 }
 
-export async function handleToolCall(functionCall, userId) {
+// Great-circle distance in metres. Used to sort and describe results, since
+// Overpass returns matches in no particular order.
+function distanceMeters(lat1, lon1, lat2, lon2) {
+  const R = 6371000;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+// Only these reach the Overpass query, so a model-supplied category can never
+// inject arbitrary query syntax. Anything unrecognised falls back to
+// restaurant, which is overwhelmingly what gets asked for.
+const PLACE_CATEGORIES = {
+  restaurant: "restaurant", cafe: "cafe", fast_food: "fast_food", bar: "bar",
+  pub: "pub", pharmacy: "pharmacy", bakery: "bakery", hospital: "hospital",
+  bank: "bank", fuel: "fuel", hotel: "hotel", supermarket: "supermarket",
+  park: "park",
+};
+
+/**
+ * Local business search via OpenStreetMap's Overpass API.
+ *
+ * web_search (DuckDuckGo Instant Answer) genuinely cannot do this — it returns
+ * encyclopaedia abstracts, not businesses — which is why "find an Italian place
+ * near me" never worked. Overpass needs no API key and takes real coordinates,
+ * which the connection already has from IP geolocation or the user's stored
+ * home location.
+ */
+async function findPlacesNearby(args, coords) {
+  const lat = coords && Number.isFinite(coords.lat) ? coords.lat : null;
+  const lon = coords && Number.isFinite(coords.lon) ? coords.lon : null;
+  if (lat === null || lon === null) {
+    return { error: "no location available", places: [] };
+  }
+
+  const category = PLACE_CATEGORIES[String(args.category || "").toLowerCase()] || "restaurant";
+  // Clamped: a huge radius makes Overpass slow and returns results too far to
+  // be useful spoken aloud.
+  const radius = Math.min(Math.max(Number(args.radius_meters) || 5000, 500), 20000);
+  const keyword = String(args.keyword || "").trim().toLowerCase().replace(/[^a-z0-9 _-]/g, "").slice(0, 40);
+
+  // supermarket/park are OSM shop/leisure keys rather than amenity values.
+  const key = category === "supermarket" ? "shop" : category === "park" ? "leisure" : "amenity";
+  // Match the keyword against cuisine OR name, so "italian" finds both a place
+  // tagged cuisine=italian and one called "Italian Kitchen".
+  //
+  // Every clause carries its OWN (around:) filter. Appending one filter after a
+  // union of statements binds it to the last statement only, leaving the others
+  // as unbounded planet-wide queries — which times out rather than failing
+  // visibly, so it looks like the API is down.
+  const around = `(around:${radius},${lat},${lon})`;
+  const clauses = keyword
+    ? [
+        `node["${key}"="${category}"]["cuisine"~"${keyword}",i]${around};`,
+        `node["${key}"="${category}"]["name"~"${keyword}",i]${around};`,
+      ]
+    : [`node["${key}"="${category}"]["name"]${around};`];
+  const query = `[out:json][timeout:15];(${clauses.join("")});out body 40;`;
+
+  // Overpass is free and unauthenticated, and answers 429 when a host is busy
+  // or has seen too many requests recently. Fall through to a mirror rather
+  // than reporting failure — a single retry covers it in practice, and the
+  // mirrors run the same API against the same data.
+  const endpoints = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+  ];
+  try {
+    let res = null;
+    for (const url of endpoints) {
+      try {
+        res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": "Argus/1.0" },
+          body: "data=" + encodeURIComponent(query),
+          signal: AbortSignal.timeout(12000),
+        });
+        if (res.ok) break;
+      } catch (e) {
+        res = null; // timeout or network error — try the mirror
+      }
+    }
+    if (!res || !res.ok) {
+      return {
+        error: `places lookup unavailable${res ? ` (${res.status})` : ""}`,
+        places: [],
+        message: "The places service didn't respond. Tell the user you couldn't check right now — do not name any businesses from memory.",
+      };
+    }
+    const data = await res.json();
+
+    const places = (data.elements || [])
+      .filter((el) => el.tags && el.tags.name)
+      .map((el) => {
+        const t = el.tags;
+        const street = [t["addr:housenumber"], t["addr:street"]].filter(Boolean).join(" ");
+        const meters = distanceMeters(lat, lon, el.lat, el.lon);
+        return {
+          name: t.name,
+          cuisine: t.cuisine ? t.cuisine.replace(/[_;]/g, " ") : null,
+          address: street || t["addr:city"] || null,
+          distance_miles: Math.round((meters / 1609.34) * 10) / 10,
+          _m: meters,
+        };
+      })
+      .sort((a, b) => a._m - b._m)
+      .slice(0, 8)
+      .map(({ _m, ...rest }) => rest);
+
+    return {
+      category,
+      keyword: keyword || null,
+      radius_miles: Math.round((radius / 1609.34) * 10) / 10,
+      count: places.length,
+      places,
+      // Said explicitly so the model reports an empty result honestly rather
+      // than inventing plausible-sounding local businesses.
+      message: places.length
+        ? `${places.length} found, nearest first.`
+        : `Nothing matching within ${Math.round(radius / 1609.34)} miles. Say so rather than guessing; offer to search wider.`,
+    };
+  } catch (e) {
+    return { error: e.name === "TimeoutError" ? "places lookup timed out" : e.message, places: [] };
+  }
+}
+
+export async function handleToolCall(functionCall, userId, coords) {
   const { name, args } = functionCall;
 
   switch (name) {
@@ -495,6 +645,11 @@ export async function handleToolCall(functionCall, userId) {
       } catch(e) { return {query,error:e.message,results:[]}; }
     }
 
+    case "find_places_nearby": {
+      console.log("Places search:", args.category, args.keyword || "(no keyword)");
+      return await findPlacesNearby(args, coords);
+    }
+
     case "get_restaurant_website": {
       const {restaurant_name,location}=args;
       console.log("Lookup website:",restaurant_name);
@@ -620,6 +775,8 @@ You see the user's world through their camera, hear them naturally, and help opt
 
 ### 🔍 Web Search Agent
 When you need real-world information to give accurate advice:
+- Use find_places_nearby for ANYTHING location-based — "somewhere to eat", "an Italian place", "is there a pharmacy near here". It returns real names, distances and addresses around where the user actually is. web_search cannot find local businesses and will return nothing useful for these, so do not reach for it first.
+- When reporting places, lead with the nearest two or three by name and distance; don't read out the whole list. If it returns nothing, say so plainly and offer to search a wider radius — never invent a business name.
 - Use web_search to ground responses with current facts
 - Product how-to guides, repair instructions, nutritional info
 - Any factual question where accuracy matters
