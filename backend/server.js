@@ -468,6 +468,15 @@ wss.on("connection", async (clientWs, req) => {
   // start responding, separate from connection-open latency.
   let lastAudioForwardedAt = 0;
   let responseInFlight = false;
+  // When the current response began, and how many mic chunks were dropped
+  // because of it. See the suppression block in the client audio handler.
+  let responseStartedAt = 0;
+  let suppressedChunks = 0;
+  // Ceiling on how long mic audio may be suppressed for a single turn. Long
+  // enough to cover any real response (the longest measured is ~12s), short
+  // enough that a turn which never reports completion cannot leave the
+  // microphone dead for the rest of the session.
+  const MAX_SUPPRESS_MS = 20000;
   // Turn-shape instrumentation. The existing "turn latency" number is measured
   // from the last forwarded audio chunk, and the client sends a chunk every
   // ~1s whether or not anyone is speaking — so that metric is structurally
@@ -580,6 +589,8 @@ wss.on("connection", async (clientWs, req) => {
             const isResponseActivity = !!(msg.toolCall || audioData || (msg.serverContent && msg.serverContent.outputTranscription && msg.serverContent.outputTranscription.text));
             if (isResponseActivity && !responseInFlight) {
               responseInFlight = true;
+              responseStartedAt = Date.now();
+              suppressedChunks = 0;
               turnStartedAt = Date.now();
               turnAudioChunks = 0;
               const quietMs = lastTurnEndedAt ? Date.now() - lastTurnEndedAt : 0;
@@ -699,6 +710,11 @@ wss.on("connection", async (clientWs, req) => {
                 const spokenMs = Date.now() - turnStartedAt;
                 console.log(`🔇 Turn complete — ${turnAudioChunks} audio chunks over ${spokenMs}ms`);
               }
+              // Chunks dropped this turn. If barge-ins persist while this is
+              // non-zero, something other than the mic stream is triggering
+              // them; if this is zero, the client gate is catching everything
+              // and the server gate is redundant.
+              if (suppressedChunks) console.log(`🔕 Suppressed ${suppressedChunks} mic chunks during response`);
               lastTurnEndedAt = Date.now();
               turnStartedAt = 0;
               responseInFlight = false;
@@ -751,6 +767,25 @@ wss.on("connection", async (clientWs, req) => {
           audioChunks++;
           if (audioChunks % 100 === 1) {
             console.log(`🎤 Audio chunks: ${audioChunks}`);
+          }
+          // Do not forward mic audio into a response that is already being
+          // generated. The SDK default is START_OF_ACTIVITY_INTERRUPTS, so any
+          // activity on this stream aborts the turn in progress — which is why
+          // build 46 logged a perfect 7 turns / 7 barge-ins, one per turn.
+          //
+          // The client gates this too (argusSpeakingRef in home.tsx), but it
+          // cannot close the whole window: the client only learns a response
+          // started when the first audio chunk REACHES it, ~1.7s after Gemini
+          // actually began generating. Every chunk sent in that gap still
+          // interrupts. Here responseInFlight flips the moment the server sees
+          // the first response activity, so the gap is zero.
+          //
+          // Bounded so a turn that never completes cannot silently kill the
+          // microphone for the rest of the session — that failure mode cost 6
+          // of 21 sessions once already (see CLAUDE.md #33).
+          if (responseInFlight && Date.now() - responseStartedAt < MAX_SUPPRESS_MS) {
+            suppressedChunks++;
+            return;
           }
           session.sendRealtimeInput({
             media: {
