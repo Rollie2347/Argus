@@ -329,17 +329,46 @@ const PLACE_CATEGORIES = {
  * which the connection already has from IP geolocation or the user's stored
  * home location.
  */
-async function findPlacesNearby(args, coords) {
-  const lat = coords && Number.isFinite(coords.lat) ? coords.lat : null;
-  const lon = coords && Number.isFinite(coords.lon) ? coords.lon : null;
+async function findPlacesNearby(args, coords, userId) {
+  let lat = coords && Number.isFinite(coords.lat) ? coords.lat : null;
+  let lon = coords && Number.isFinite(coords.lon) ? coords.lon : null;
+  let origin = "ip";
+
+  // Prefer the stored home coordinates when the user is at home. IP
+  // geolocation resolves to the ISP's routing point, which can be many miles
+  // off: a real search from this path came back with a suburban branch of a
+  // downtown restaurant, because the ISP had placed the user well north of
+  // where they actually were, and a 3-mile search found nothing in a city full
+  // of matching restaurants. homeLocation is geocoded from a city the user
+  // typed themselves, so it is precise.
+  //
+  // Same 50-mile "same metro area" rule the system instruction uses to decide
+  // at-home vs travelling — beyond that, IP geo is the better guess, because
+  // the user has genuinely moved and home coordinates would be actively wrong.
+  try {
+    const mem = await getUserMemory(userId);
+    const home = mem && mem.homeLocation;
+    if (home && Number.isFinite(home.lat) && Number.isFinite(home.lon)) {
+      if (lat === null || lon === null || distanceMiles(lat, lon, home.lat, home.lon) <= 50) {
+        lat = home.lat;
+        lon = home.lon;
+        origin = "home";
+      }
+    }
+  } catch { /* fall through to IP coordinates */ }
+
   if (lat === null || lon === null) {
     return { error: "no location available", places: [] };
   }
 
   const category = PLACE_CATEGORIES[String(args.category || "").toLowerCase()] || "restaurant";
-  // Clamped: a huge radius makes Overpass slow and returns results too far to
-  // be useful spoken aloud.
-  const radius = Math.min(Math.max(Number(args.radius_meters) || 5000, 500), 20000);
+  // Default ~10 miles, not 3. A 5km default produced zero results on a real
+  // search and forced the model to call again with a wider radius — 2061ms
+  // plus 1040ms of tool time for one answer. Cities are bigger than 3 miles
+  // and results are distance-sorted anyway, so a wider net costs nothing in
+  // answer quality and usually saves the second round trip. Clamped at both
+  // ends: too wide is slow on Overpass and returns places too far to suggest.
+  const radius = Math.min(Math.max(Number(args.radius_meters) || 16000, 500), 25000);
   const keyword = String(args.keyword || "").trim().toLowerCase().replace(/[^a-z0-9 _-]/g, "").slice(0, 40);
 
   // supermarket/park are OSM shop/leisure keys rather than amenity values.
@@ -413,6 +442,7 @@ async function findPlacesNearby(args, coords) {
     return {
       category,
       keyword: keyword || null,
+      searched_from: origin === "home" ? "the user's home location" : "approximate network location",
       radius_miles: Math.round((radius / 1609.34) * 10) / 10,
       count: places.length,
       places,
@@ -647,7 +677,7 @@ export async function handleToolCall(functionCall, userId, coords) {
 
     case "find_places_nearby": {
       console.log("Places search:", args.category, args.keyword || "(no keyword)");
-      return await findPlacesNearby(args, coords);
+      return await findPlacesNearby(args, coords, userId);
     }
 
     case "get_restaurant_website": {
