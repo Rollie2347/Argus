@@ -784,7 +784,10 @@ wss.on("connection", async (clientWs, req) => {
           // A gap much longer than CHUNK_MS means the client stopped sending:
           // the recording loop died, or a gate is stuck shut. Silent before
           // this, and invisible in the chunk counter.
-          if (lastAudioReceivedAt && Date.now() - lastAudioReceivedAt > 5000) {
+          // Only meaningful outside a response — during one the gate is
+          // deliberately dropping chunks, so a gap is expected and warning
+          // about it is noise. The first version fired on every single turn.
+          if (!responseInFlight && lastAudioReceivedAt && Date.now() - lastAudioReceivedAt > 5000) {
             console.warn(`🎤⚠️ Mic gap: ${Date.now() - lastAudioReceivedAt}ms since last chunk`);
           }
           lastAudioReceivedAt = Date.now();
