@@ -408,6 +408,33 @@ wss.on("connection", async (clientWs, req) => {
     return msgCount <= WS_MSG_RATE_LIMIT;
   }
 
+  // The client fires `greet` on a fixed 1200ms timer after the WebSocket opens
+  // (mobile/services/websocket.ts:49) with no way to know whether the Gemini
+  // session exists yet, and the main handler gates on `session` with no else
+  // branch — so an early greet was discarded with nothing logged. Argus then
+  // never spoke first, the user waited for a greeting that had already been
+  // thrown away, and eventually spoke themselves: one real session logged ~25s
+  // of silence followed by a completely normal 1515ms reply, which reads as
+  // "it took 40 seconds to answer".
+  //
+  // This MUST sit above waitForAuth. That helper detaches its own listener the
+  // moment auth succeeds, leaving no `message` listener at all across
+  // reserveGlobalSlot (174-1418ms measured) and buildSystemInstruction
+  // (85-665ms) — and `ws` drops messages with no listener rather than
+  // buffering them. A first attempt latched below that gap and changed
+  // nothing, which scripts/greet-race.mjs caught before it reached anyone.
+  //
+  // Fixed server-side deliberately: it repairs every build already installed
+  // rather than waiting on a release.
+  let greetPending = false;
+  const earlyGreetListener = (raw) => {
+    try {
+      const m = JSON.parse(raw.toString());
+      if (m && m.type === "greet") greetPending = true;
+    } catch { /* malformed frames are the main handler's problem */ }
+  };
+  clientWs.on("message", earlyGreetListener);
+
   const auth = await waitForAuth(clientWs);
   if (!auth) {
     console.warn("Rejected unauthenticated WS connection from", ip);
@@ -537,26 +564,6 @@ wss.on("connection", async (clientWs, req) => {
   // approximation (transcription lags real speech end slightly), but a much
   // closer proxy, and the only one available without client-side changes.
   let lastUserSpeechAt = 0;
-  // The client fires `greet` on a fixed 1200ms timer after the WebSocket opens
-  // (mobile/services/websocket.ts), with no way of knowing whether the Gemini
-  // session exists yet. Connection-open measures 1.0–1.6s, so the greet lands
-  // early roughly half the time — and the main handler gates on `session`, so
-  // it was silently discarded with nothing logged. Argus then never spoke
-  // first, the user sat waiting for a greeting that had already been thrown
-  // away, and eventually spoke themselves: measured as ~25s of silence
-  // followed by a perfectly normal 1515ms reply, which reads to the user as
-  // "it took 40 seconds to answer". Latch it here and replay it once the
-  // session is live. Fixed server-side deliberately, so it also repairs every
-  // build already installed rather than waiting on a release.
-  let greetPending = false;
-  const earlyGreetListener = (raw) => {
-    try {
-      const m = JSON.parse(raw.toString());
-      if (m && m.type === "greet" && !session) greetPending = true;
-    } catch { /* malformed frames are the main handler's problem */ }
-  };
-  clientWs.on("message", earlyGreetListener);
-
   try {
     // Build dynamic system instruction with live memory, weather + location context
     const sysStart = Date.now();
