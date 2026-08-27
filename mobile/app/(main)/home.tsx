@@ -63,8 +63,14 @@ const TOOL_LABELS: Record<string, string> = {
   get_weather: "Checking the weather",
   log_daily_activity: "Logging that",
   get_daily_summary: "Pulling up your day",
+  forget_memory: "Forgetting that",
+  update_profile: "Updating your profile",
+  mark_profile_reviewed: "Saving your details",
   web_search: "Searching the web",
-  get_restaurant_website: "Finding the restaurant's website",
+  find_places_nearby: "Looking for places near you",
+  read_webpage: "Reading the page",
+  research_topic: "Looking that up properly",
+  research_place: "Reading up on that place",
 };
 
 async function getAudioB64(uri: string): Promise<string> {
