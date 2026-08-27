@@ -537,6 +537,25 @@ wss.on("connection", async (clientWs, req) => {
   // approximation (transcription lags real speech end slightly), but a much
   // closer proxy, and the only one available without client-side changes.
   let lastUserSpeechAt = 0;
+  // The client fires `greet` on a fixed 1200ms timer after the WebSocket opens
+  // (mobile/services/websocket.ts), with no way of knowing whether the Gemini
+  // session exists yet. Connection-open measures 1.0–1.6s, so the greet lands
+  // early roughly half the time — and the main handler gates on `session`, so
+  // it was silently discarded with nothing logged. Argus then never spoke
+  // first, the user sat waiting for a greeting that had already been thrown
+  // away, and eventually spoke themselves: measured as ~25s of silence
+  // followed by a perfectly normal 1515ms reply, which reads to the user as
+  // "it took 40 seconds to answer". Latch it here and replay it once the
+  // session is live. Fixed server-side deliberately, so it also repairs every
+  // build already installed rather than waiting on a release.
+  let greetPending = false;
+  const earlyGreetListener = (raw) => {
+    try {
+      const m = JSON.parse(raw.toString());
+      if (m && m.type === "greet" && !session) greetPending = true;
+    } catch { /* malformed frames are the main handler's problem */ }
+  };
+  clientWs.on("message", earlyGreetListener);
 
   try {
     // Build dynamic system instruction with live memory, weather + location context
@@ -797,6 +816,18 @@ wss.on("connection", async (clientWs, req) => {
     });
 
     console.log("✅ Gemini session established with tools:", TOOLS[0].functionDeclarations.map(f => f.name).join(", "));
+
+    // Safe to detach synchronously here: `session` was just assigned and no
+    // message event can fire between that assignment and this line, so a greet
+    // is either latched above or handled by the main listener below — never
+    // both, never neither.
+    clientWs.off("message", earlyGreetListener);
+    if (greetPending) {
+      console.log("👋 Greet arrived before the Gemini session was ready — replaying it");
+      try {
+        session.sendClientContent({ turns: [{ role: "user", parts: [{ text: "greet" }] }], turnComplete: true });
+      } catch (e) { console.warn("Replayed greet failed:", e.message); }
+    }
 
     // Client → Gemini
     clientWs.on("message", (raw) => {
