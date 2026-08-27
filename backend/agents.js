@@ -1025,32 +1025,51 @@ async function findPlacesNearby(args, coords, userId) {
     : [`node["${key}"="${category}"]["name"]${around};`];
   const query = `[out:json][timeout:15];(${clauses.join("")});out body 40;`;
 
-  // Overpass is free and unauthenticated, and answers 429 when a host is busy
-  // or has seen too many requests recently. Fall through to a mirror rather
-  // than reporting failure — a single retry covers it in practice, and the
-  // mirrors run the same API against the same data.
+  // Overpass is free and unauthenticated, and answers 429 or 502 when a host is
+  // busy. Fall through to a mirror rather than reporting failure — the mirrors
+  // run the same API against the same data.
+  //
+  // A real session hit 502 on BOTH endpoints and spent 13,782ms discovering
+  // that, which is a very long silence before admitting defeat. Probed
+  // 2026-08-27: overpass-api.de 200/1165ms, kumi.systems 502, maps.mail.ru
+  // 200/5964ms, private.coffee timed out. So kumi alone is not enough cover.
+  //
+  // ⚠️ overpass.osm.ch answered 200 in 903ms with ZERO elements for a query the
+  // others returned results for — a partial index. Deliberately NOT in this
+  // list: an empty 200 is worse than an error, because it makes Argus tell the
+  // user there is nothing nearby, confidently and wrongly. Only add a mirror
+  // after checking it returns the same results, not just the same status.
   const endpoints = [
     "https://overpass-api.de/api/interpreter",
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
   ];
+  // Whole-lookup budget, so a chain of dead mirrors cannot hold the turn open
+  // indefinitely. Failing honestly at ~11s beats succeeding at 30.
+  const OVERPASS_BUDGET_MS = 12000;
+  const lookupStarted = Date.now();
   try {
     let res = null;
+    let lastStatus = 0;
     for (const url of endpoints) {
+      const remaining = OVERPASS_BUDGET_MS - (Date.now() - lookupStarted);
+      if (remaining < 1500) break; // not enough left to be worth trying
       try {
-        res = await fetch(url, {
+        const r = await fetch(url, {
           method: "POST",
           headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": "Argus/1.0" },
           body: "data=" + encodeURIComponent(query),
-          signal: AbortSignal.timeout(12000),
+          signal: AbortSignal.timeout(Math.min(6000, remaining)),
         });
-        if (res.ok) break;
+        if (r.ok) { res = r; console.log(`   places via ${new URL(url).hostname} — ${Date.now() - lookupStarted}ms`); break; }
+        lastStatus = r.status;
       } catch (e) {
-        res = null; // timeout or network error — try the mirror
+        // timeout or network error — try the next mirror
       }
     }
-    if (!res || !res.ok) {
+    if (!res) {
       return {
-        error: `places lookup unavailable${res ? ` (${res.status})` : ""}`,
+        error: `places lookup unavailable${lastStatus ? ` (${lastStatus})` : ""}`,
         places: [],
         message: "The places service didn't respond. Tell the user you couldn't check right now — do not name any businesses from memory.",
       };
