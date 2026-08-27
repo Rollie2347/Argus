@@ -286,6 +286,42 @@ function sanitizeLocationField(s) {
 // every access to msg.data was logging "there are non-data parts
 // [thought]..." and re-walking every part — the exact bug class known issue
 // #33 already fixed for msg.text, just via the sibling getter this time.
+/**
+ * Loudness of one inbound mic chunk, for the logs.
+ *
+ * Incoming chunks are base64 PCM16LE at 16kHz. RMS separates the two failures
+ * a chunk counter cannot: a live recording loop capturing real speech, and a
+ * live recording loop capturing nothing. Silence sits in the single digits;
+ * a room with someone talking in it lands in the hundreds or thousands.
+ *
+ * "silent" here means the audio is inaudible, which on its own does not say
+ * whose fault that is — a muted input, a mic captured by another app, or the
+ * wrong input route all look the same from here. It does rule out the whole
+ * server and model side, which is the expensive half to chase.
+ */
+function describeMicLevel(b64) {
+  try {
+    const buf = Buffer.from(b64, "base64");
+    const n = Math.floor(buf.length / 2);
+    if (!n) return "level unknown (empty chunk)";
+    let sum = 0;
+    let peak = 0;
+    for (let i = 0; i < n; i++) {
+      const s = buf.readInt16LE(i * 2);
+      sum += s * s;
+      const a = Math.abs(s);
+      if (a > peak) peak = a;
+    }
+    const rms = Math.round(Math.sqrt(sum / n));
+    // 32767 is full scale; ~30 RMS is below anything a mic in a real room
+    // produces, so it means the capture is not picking up sound at all.
+    const verdict = rms < 30 ? "SILENT — capturing no sound" : "live";
+    return `RMS ${rms} peak ${peak} (${verdict})`;
+  } catch {
+    return "level unknown (undecodable chunk)";
+  }
+}
+
 function extractAudioData(msg) {
   const parts = msg.serverContent && msg.serverContent.modelTurn && msg.serverContent.modelTurn.parts;
   if (!parts) return undefined;
@@ -779,7 +815,19 @@ wss.on("connection", async (clientWs, req) => {
           // answer". 25 bounds a stall to ~25s of ambiguity at negligible
           // log volume.
           if (audioChunks % 25 === 1) {
-            console.log(`🎤 Audio chunks: ${audioChunks}`);
+            // Level, not just count. A chunk counter proves the recording loop
+            // is alive; it says nothing about whether the loop is capturing
+            // SOUND. Those two failures look identical in the logs and are
+            // completely different bugs — one session logged 26 perfectly
+            // cadenced chunks while Gemini transcribed zero speech from them,
+            // and there was no way to tell "the client sent silence" from
+            // "Gemini ignored real audio" without guessing.
+            //
+            // Only every 25th chunk, so the base64 decode stays off the hot
+            // path — CPU is the binding constraint here (CLAUDE.md #36). This
+            // is loudness only, never content: no transcript, nothing that
+            // contradicts the App Store disclosure.
+            console.log(`🎤 Audio chunks: ${audioChunks} — mic ${describeMicLevel(msg.data)}`);
           }
           // A gap much longer than CHUNK_MS means the client stopped sending:
           // the recording loop died, or a gate is stuck shut. Silent before
