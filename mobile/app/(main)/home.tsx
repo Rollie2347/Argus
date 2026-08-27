@@ -144,6 +144,26 @@ export default function Home() {
   // realtimeInputConfig.automaticActivityDetection instead — that field has
   // caused an identical fatal 1007 on this model twice (see CLAUDE.md #27/#41).
   const argusSpeakingRef = useRef(false);
+  // When the current response started. Backs the timeout below.
+  const speakingSinceRef = useRef(0);
+
+  // The gate must never be able to hold the microphone shut indefinitely. If
+  // turn_complete goes missing for any reason — a dropped message, a session
+  // that ends mid-response — an unbounded gate silently kills the mic for the
+  // rest of the session, which is the single worst failure this app has (see
+  // known issue #33: it cost 6 of 21 sessions and produced no error anywhere).
+  // The server-side gate is bounded at 20s for exactly this reason; this
+  // mirrors it slightly longer, so the server's bound is normally the one that
+  // matters and this is purely a backstop.
+  const MAX_GATE_MS = 25000;
+  function argusIsSpeaking() {
+    if (!argusSpeakingRef.current) return false;
+    if (Date.now() - speakingSinceRef.current > MAX_GATE_MS) {
+      argusSpeakingRef.current = false;
+      return false;
+    }
+    return true;
+  }
   const audioStartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const playbackTokenRef = useRef(0);
 
@@ -166,7 +186,7 @@ export default function Home() {
     if (msg.type === "connected") { clearConnectTimeout(); setStatus("observing"); }
     else if (msg.type === "text") { addLine(msg.data, "argus"); setStatus("observing"); clearToolStatus(); }
     else if (msg.type === "tool_event") showToolStatus(TOOL_LABELS[msg.tool] || msg.tool);
-    else if (msg.type === "audio") { argusSpeakingRef.current = true; setStatus("speaking"); enqueueAudio(msg.data); }
+    else if (msg.type === "audio") { argusSpeakingRef.current = true; speakingSinceRef.current = Date.now(); setStatus("speaking"); enqueueAudio(msg.data); }
     // Gemini abandoned the response it was generating (barge-in). Anything
     // still queued belongs to that abandoned turn, so playing it would talk
     // over — and then repeat ahead of — the replacement response that's about
@@ -193,6 +213,13 @@ export default function Home() {
     if (audioStartTimerRef.current) { clearTimeout(audioStartTimerRef.current); audioStartTimerRef.current = null; }
     epochRef.current++;
     socketRef.current = null;
+    // Must be cleared here. This is a ref on a mounted component, so it
+    // survives disconnect -> reconnect: tearing down while Argus was mid-
+    // response leaves it true with no turn_complete ever coming, and every
+    // later session in the same app launch then sends ZERO mic audio. That
+    // reads as "it just won't answer" and is the same silent dead-mic class
+    // of bug as known issue #33.
+    argusSpeakingRef.current = false;
     stopAudio(); stopFrameLoop(); stopPlayback(); clearToolStatus();
   }
 
@@ -260,13 +287,13 @@ export default function Home() {
           // a chunk landing then is exactly what aborts it. Skipping the
           // encode also keeps that work off the CPU, which is the binding
           // Cloud Run constraint on the other end.
-          if (uri && !argusSpeakingRef.current) {
+          if (uri && !argusIsSpeaking()) {
             // Re-read the current socket at send time rather than sending to a
             // captured one: a captured socket could still be OPEN after the app
             // moved to a new session, delivering this chunk into the old Gemini
             // session, whose reply then played over the live session's audio.
             getAudioB64(uri).then(b64 => {
-              if (argusSpeakingRef.current) return;
+              if (argusIsSpeaking()) return;
               if (epochRef.current === myEpoch && socketRef.current?.ready) socketRef.current.sendAudio(b64);
             }).catch(() => {});
           }

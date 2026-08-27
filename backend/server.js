@@ -472,6 +472,9 @@ wss.on("connection", async (clientWs, req) => {
   // because of it. See the suppression block in the client audio handler.
   let responseStartedAt = 0;
   let suppressedChunks = 0;
+  // Wall-clock of the last mic chunk actually received from the client, used
+  // to spot the mic going quiet mid-session.
+  let lastAudioReceivedAt = 0;
   // Ceiling on how long mic audio may be suppressed for a single turn. Long
   // enough to cover any real response (the longest measured is ~12s), short
   // enough that a turn which never reports completion cannot leave the
@@ -769,9 +772,22 @@ wss.on("connection", async (clientWs, req) => {
         if (msg.type === "audio" && session) {
           if (typeof msg.data !== "string" || !msg.data || msg.data.length > MAX_AUDIO_B64_LEN) return;
           audioChunks++;
-          if (audioChunks % 100 === 1) {
+          // Every 25, not every 100. At one chunk per second a 27-second
+          // session only ever logged "chunks: 1", which made a live mic and a
+          // mic that died after the first chunk look identical in the logs —
+          // exactly the distinction needed to diagnose "it just wouldn't
+          // answer". 25 bounds a stall to ~25s of ambiguity at negligible
+          // log volume.
+          if (audioChunks % 25 === 1) {
             console.log(`🎤 Audio chunks: ${audioChunks}`);
           }
+          // A gap much longer than CHUNK_MS means the client stopped sending:
+          // the recording loop died, or a gate is stuck shut. Silent before
+          // this, and invisible in the chunk counter.
+          if (lastAudioReceivedAt && Date.now() - lastAudioReceivedAt > 5000) {
+            console.warn(`🎤⚠️ Mic gap: ${Date.now() - lastAudioReceivedAt}ms since last chunk`);
+          }
+          lastAudioReceivedAt = Date.now();
           // Do not forward mic audio into a response that is already being
           // generated. The SDK default is START_OF_ACTIVITY_INTERRUPTS, so any
           // activity on this stream aborts the turn in progress — which is why
