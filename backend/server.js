@@ -47,6 +47,26 @@ const MODEL = "gemini-2.5-flash-native-audio-preview-12-2025";
 // values for, without a code change each time.
 const THINKING_BUDGET = process.env.THINKING_BUDGET !== undefined ? parseInt(process.env.THINKING_BUDGET, 10) : null;
 
+// Google Search grounding, first-party, using the Gemini key already present.
+//
+// Replaces scraping a search engine, which was never going to hold: Mojeek
+// soft-throttles some IPs (200 with an empty results page) and hard-blocks
+// others (403), and Cloud Run's egress IP is not fixed, so search reliability
+// was luck of the draw per instance. Every keyless alternative was probed on
+// 2026-08-27 and none was usable — DuckDuckGo's lite endpoint returned nothing
+// but a sponsored ad, searx.be has JSON disabled, ecosia 403s, Marginalia is a
+// niche index.
+//
+// ⚠️ This is a change to the LIVE SESSION CONFIG, which is the exact class of
+// change that killed sessions with a fatal 1007 twice (see the
+// realtimeInputConfig comment further down). It is therefore a kill switch,
+// not a constant: set GOOGLE_SEARCH_GROUNDING=0 to turn it off with
+// `gcloud run services update argus --region us-central1
+//  --update-env-vars GOOGLE_SEARCH_GROUNDING=0`, which takes ~30s instead of
+// the ~5min a rebuild costs. Verify with scripts/greet-race.mjs, which opens a
+// real session and fails loudly if setup breaks.
+const GOOGLE_SEARCH_GROUNDING = process.env.GOOGLE_SEARCH_GROUNDING !== "0";
+
 // Validate required env vars at startup
 if (!GEMINI_API_KEY) {
   console.error("FATAL: GEMINI_API_KEY is not set. Set it in your .env file or environment.");
@@ -626,7 +646,10 @@ wss.on("connection", async (clientWs, req) => {
         systemInstruction: {
           parts: [{ text: systemInstruction }],
         },
-        tools: TOOLS,
+        // Grounding first, then the in-process functions. Both kinds of tool
+        // coexist in this array — googleSearch is handled inside the model, so
+        // no toolCall ever arrives for it and handleToolCall never sees one.
+        tools: GOOGLE_SEARCH_GROUNDING ? [{ googleSearch: {} }, ...TOOLS] : TOOLS,
       },
       callbacks: {
         onopen: () => {
@@ -673,6 +696,19 @@ wss.on("connection", async (clientWs, req) => {
             // A long gap with NO user-speech events means dead air on the mic
             // side; a long gap full of them means Gemini heard speech and chose
             // not to respond — completely different bugs.
+            // Grounding happens inside the model, so there is no toolCall to
+            // log and otherwise no way to tell a grounded answer from one made
+            // up. Domains only — enough to confirm it fired and to sanity-check
+            // the sources, without dumping page content into retained logs.
+            const gm = msg.serverContent && msg.serverContent.groundingMetadata;
+            if (gm) {
+              const domains = [...new Set((gm.groundingChunks || [])
+                .map((c) => { try { return new URL(c.web && c.web.uri).hostname.replace(/^www\./, ""); } catch { return null; } })
+                .filter(Boolean))];
+              const q = (gm.webSearchQueries || []).join(" | ").slice(0, 120);
+              console.log(`🔎 Google Search grounding used${q ? ` — queries: ${q}` : ""}${domains.length ? ` — sources: ${domains.slice(0, 5).join(", ")}` : ""}`);
+            }
+
             const inTr = msg.serverContent && msg.serverContent.inputTranscription;
             if (inTr && inTr.text) {
               if (!userSpeechOpen) { userSpeechOpen = true; console.log("🎙️ User speech detected"); }
@@ -822,7 +858,7 @@ wss.on("connection", async (clientWs, req) => {
       },
     });
 
-    console.log("✅ Gemini session established with tools:", TOOLS[0].functionDeclarations.map(f => f.name).join(", "));
+    console.log(`✅ Gemini session established${GOOGLE_SEARCH_GROUNDING ? " (Google Search grounding ON)" : " (grounding OFF)"} with tools:`, TOOLS[0].functionDeclarations.map(f => f.name).join(", "));
 
     // Safe to detach synchronously here: `session` was just assigned and no
     // message event can fire between that assignment and this line, so a greet
