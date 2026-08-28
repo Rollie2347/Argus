@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read|Edit|Write|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "shell": "powershell",
+            "command": "$json = [Console]::In.ReadToEnd() | ConvertFrom-Json; $path = $json.tool_input.file_path; $cmd = $json.tool_input.command; if ($path -match '\\.env$|service-account\\.json$' -or $cmd -match '\\.env|service-account\\.json') { Write-Error 'Blocked: this file may contain secrets'; exit 2 }"
+          }
+        ]
+      }
+    ]
+  }
+}

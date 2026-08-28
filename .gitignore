@@ -4,3 +4,9 @@ node_modules/
 .DS_Store
 service-account.json
 mobile/.env
+
+# Local Claude Code permissions (machine-specific)
+.claude/settings.local.json
+
+# audio-probe.mjs diagnostic output (regenerate with backend/scripts/audio-probe.mjs)
+backend/scripts/*.wav
