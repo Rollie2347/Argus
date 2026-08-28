@@ -697,16 +697,26 @@ wss.on("connection", async (clientWs, req) => {
             // side; a long gap full of them means Gemini heard speech and chose
             // not to respond — completely different bugs.
             // Grounding happens inside the model, so there is no toolCall to
-            // log and otherwise no way to tell a grounded answer from one made
-            // up. Domains only — enough to confirm it fired and to sanity-check
-            // the sources, without dumping page content into retained logs.
+            // log and otherwise no way to tell a grounded answer from an
+            // invented one. Source domains and a query COUNT are safe to keep:
+            // they confirm it fired and let the sources be sanity-checked.
+            //
+            // The query TEXT is not. Gemini writes those queries from what the
+            // user just said, so "battery life on my Sony headphones" is the
+            // user's speech by another route — and Cloud Run logs are retained
+            // while the App Store disclosure states Argus does not store
+            // speech. It therefore sits behind the same LOG_TRANSCRIPT_TEXT
+            // gate as the input transcript, which is the same class of data.
             const gm = msg.serverContent && msg.serverContent.groundingMetadata;
             if (gm) {
               const domains = [...new Set((gm.groundingChunks || [])
                 .map((c) => { try { return new URL(c.web && c.web.uri).hostname.replace(/^www\./, ""); } catch { return null; } })
                 .filter(Boolean))];
-              const q = (gm.webSearchQueries || []).join(" | ").slice(0, 120);
-              console.log(`🔎 Google Search grounding used${q ? ` — queries: ${q}` : ""}${domains.length ? ` — sources: ${domains.slice(0, 5).join(", ")}` : ""}`);
+              const queries = gm.webSearchQueries || [];
+              console.log(`🔎 Google Search grounding used — ${queries.length} quer${queries.length === 1 ? "y" : "ies"}${domains.length ? ` — sources: ${domains.slice(0, 5).join(", ")}` : ""}`);
+              if (process.env.LOG_TRANSCRIPT_TEXT === "1" && queries.length) {
+                console.log(`   searched: ${queries.join(" | ").slice(0, 120)}`);
+              }
             }
 
             const inTr = msg.serverContent && msg.serverContent.inputTranscription;
