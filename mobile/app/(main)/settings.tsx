@@ -80,13 +80,21 @@ export default function Settings() {
           </View>
         )}
 
-        <TouchableOpacity style={s.row} onPress={() => router.push("/(main)/audio-test")}>
-          <View style={{ flex: 1 }}>
-            <Text style={s.rowLabel}>Audio A/B test</Text>
-            <Text style={s.rowSub}>Plays one reference clip under each audio configuration, to find which one muffles it</Text>
-          </View>
-          <Text style={s.rowChevron}>›</Text>
-        </TouchableOpacity>
+        {/* Developer diagnostic, not a feature. It earned its place — it is how
+            the muffling was traced to the playback gain — but it is debug
+            tooling, and Apple has already rejected this app once under 2.1
+            (App Completeness). __DEV__ keeps it available in development and
+            out of every release build. The route itself stays; only the way in
+            is gated. */}
+        {__DEV__ && (
+          <TouchableOpacity style={s.row} onPress={() => router.push("/(main)/audio-test")}>
+            <View style={{ flex: 1 }}>
+              <Text style={s.rowLabel}>Audio A/B test</Text>
+              <Text style={s.rowSub}>Plays one reference clip under each audio configuration, to find which one muffles it</Text>
+            </View>
+            <Text style={s.rowChevron}>›</Text>
+          </TouchableOpacity>
+        )}
 
         <TouchableOpacity style={s.row} onPress={() => Linking.openURL(`${BACKEND}/privacy`)}>
           <View style={{ flex: 1 }}>
