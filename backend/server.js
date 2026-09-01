@@ -35,7 +35,17 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 8080;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const WS_SHARED_SECRET = process.env.WS_SHARED_SECRET;
-const MODEL = "gemini-2.5-flash-native-audio-preview-12-2025";
+// Env-overridable so a model A/B is a ~30s env flip, not a rebuild:
+//   gcloud run services update argus --region us-central1 \
+//     --update-env-vars LIVE_MODEL=gemini-3.1-flash-live-preview
+// and revert by setting it back (or --remove-env-vars LIVE_MODEL). Verify any
+// flip with scripts/greet-race.mjs — a wrong/retired model name or an
+// unsupported config field fails at session setup, which the probe catches.
+// Candidate as of 2026-08-31: gemini-3.1-flash-live-preview (released
+// 2026-03), which Google documents as improving latency over 2.5 native
+// audio. Caveat for 3.1: thinkingConfig takes `thinkingLevel`, not
+// `thinkingBudget` — do not set THINKING_BUDGET on that arm.
+const MODEL = process.env.LIVE_MODEL || "gemini-2.5-flash-native-audio-preview-12-2025";
 // Unset by default — matches existing behavior exactly (the model's own
 // automatic thinking budget, whatever that is for this preview model).
 // LiveConnectConfig.thinkingConfig.thinkingBudget accepts 0 (disabled), -1
@@ -942,8 +952,16 @@ wss.on("connection", async (clientWs, req) => {
             suppressedChunks++;
             return;
           }
+          // `audio`, not the legacy `media` field: media serializes to
+          // realtime_input.media_chunks, which gemini-3.1-flash-live-preview
+          // rejects with a fatal `1007 realtime_input.media_chunks is
+          // deprecated. Use audio, video, or text instead.` the moment the
+          // first chunk arrives (2026-08-31 — this killed every real phone
+          // session while greet-race passed, because the probe streams no
+          // media at all). 2.5 accepts both forms; audio/video is the
+          // non-deprecated one on both models.
           session.sendRealtimeInput({
-            media: {
+            audio: {
               data: msg.data,
               mimeType: "audio/pcm;rate=16000",
             },
@@ -961,8 +979,9 @@ wss.on("connection", async (clientWs, req) => {
           if (typeof msg.data !== "string" || !msg.data || msg.data.length > MAX_IMAGE_B64_LEN) return;
           imageFrames++;
           console.log(`📷 Frame #${imageFrames}`);
+          // `video`, not `media` — see the audio send above.
           session.sendRealtimeInput({
-            media: {
+            video: {
               data: msg.data,
               mimeType: "image/jpeg",
             },

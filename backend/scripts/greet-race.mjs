@@ -27,13 +27,41 @@ const html = await (await fetch(BACKEND)).text();
 const m = html.match(/WS_SECRET\s*=\s*"([^"]*)"/i);
 if (!m) throw new Error("could not extract WS secret");
 
+// One second of silent PCM16 mono @16kHz — what the phone's mic loop sends —
+// and a minimal valid 1x1 JPEG, what the frame loop sends. Streaming these is
+// the part of a real session this probe previously did NOT cover, and the gap
+// mattered: the 2026-08-31 flip to gemini-3.1-flash-live-preview passed 10/10
+// greet-only probe runs, then killed every REAL session with `1007
+// realtime_input.media_chunks is deprecated` on the first camera frame,
+// because greet-race never sent a single byte of media. A model/config change
+// is only validated when a probe that streams BOTH kinds of media survives it.
+const SILENT_PCM_B64 = Buffer.alloc(16000 * 2).toString("base64");
+// A real (tiny) JPEG from disk, NOT a base64 literal pasted into source: the
+// first version of this embedded a from-memory string that was subtly corrupt,
+// and Gemini killed the session with `1007 Invalid value at
+// 'realtime_input.video.data' ... Base64 decoding failed` — which looks
+// exactly like the send-path bug this probe exists to catch.
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
+const TINY_JPEG_B64 = readFileSync(
+  path.join(path.dirname(fileURLToPath(import.meta.url)), "probe-frame.jpg")
+).toString("base64");
+// How long the session must survive after the media goes up. The 3.1
+// media_chunks kill arrived within ~100ms of Frame #1, so 3s is generous.
+const MEDIA_HOLD_MS = 3000;
+
 const ws = new WebSocket(BACKEND.replace(/^http/, "ws") + "/ws");
 let audioChunks = 0;
 let firstAudioAt = 0;
 let openedAt = 0;
+let mediaSentAt = 0;
+let mediaSurvived = false;
+let closedEarly = null;
 
 await new Promise((resolve) => {
   const timer = setTimeout(resolve, WAIT_MS);
+  const finish = () => { clearTimeout(timer); resolve(); };
   ws.on("open", () => {
     openedAt = Date.now();
     ws.send(JSON.stringify({ type: "user_id", id: "greet_race_probe", name: "Probe", secret: m[1] }));
@@ -48,10 +76,21 @@ await new Promise((resolve) => {
       if (!audioChunks) firstAudioAt = Date.now();
       audioChunks++;
     }
-    if (msg.type === "turn_complete" && audioChunks) { clearTimeout(timer); resolve(); }
+    if (msg.type === "error" && mediaSentAt) { closedEarly = `server error: ${msg.data}`; finish(); }
+    if (msg.type === "turn_complete" && audioChunks && !mediaSentAt) {
+      // Greet done — now exercise the media path a real session uses.
+      mediaSentAt = Date.now();
+      ws.send(JSON.stringify({ type: "audio", data: SILENT_PCM_B64 }));
+      ws.send(JSON.stringify({ type: "image", data: TINY_JPEG_B64 }));
+      console.log(`sent 1s PCM chunk + JPEG frame at +${mediaSentAt - openedAt}ms`);
+      setTimeout(() => { mediaSurvived = true; finish(); }, MEDIA_HOLD_MS);
+    }
   });
-  ws.on("error", (e) => { console.log("ws error:", e.message); clearTimeout(timer); resolve(); });
-  ws.on("close", () => { clearTimeout(timer); resolve(); });
+  ws.on("error", (e) => { console.log("ws error:", e.message); finish(); });
+  ws.on("close", (code, reason) => {
+    if (mediaSentAt && !mediaSurvived) closedEarly = `closed ${code} ${reason || ""} ${Date.now() - mediaSentAt}ms after media`;
+    finish();
+  });
 });
 try { ws.close(); } catch {}
 
@@ -63,4 +102,11 @@ if (audioChunks) {
 } else {
   console.log("RESULT: SILENCE — the greet was dropped and Argus never spoke");
 }
-process.exit(audioChunks ? 0 : 1);
+if (mediaSurvived) {
+  console.log(`MEDIA: session survived ${MEDIA_HOLD_MS}ms after a real PCM chunk + JPEG frame`);
+} else if (closedEarly) {
+  console.log(`MEDIA: FAILED — ${closedEarly}`);
+} else {
+  console.log("MEDIA: not exercised (greet never completed)");
+}
+process.exit(audioChunks && mediaSurvived ? 0 : 1);
