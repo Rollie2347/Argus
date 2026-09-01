@@ -77,6 +77,31 @@ const THINKING_BUDGET = process.env.THINKING_BUDGET !== undefined ? parseInt(pro
 // real session and fails loudly if setup breaks.
 const GOOGLE_SEARCH_GROUNDING = process.env.GOOGLE_SEARCH_GROUNDING !== "0";
 
+// 3.1-only session-config knobs, every one omitted from the config entirely
+// unless its env var is set — the same kill-switch pattern as LIVE_MODEL and
+// GOOGLE_SEARCH_GROUNDING, because session-config fields are the class of
+// change that has fatally 1007'd twice on 2.5. Flip with
+// `gcloud run services update argus --update-env-vars ...` (~30s) and validate
+// with scripts/greet-race.mjs (media path) + scripts/latency-probe.mjs before
+// trusting a combination.
+//
+// THINKING_LEVEL ("minimal"|"low"|"medium"|"high"): 3.1's replacement for
+//   thinkingBudget. Docs say the DEFAULT is already "minimal" (lowest
+//   latency), so this is not a speed lever — it exists for testing whether a
+//   higher level improves answer quality enough to pay for.
+// VAD_SILENCE_MS: automaticActivityDetection.silenceDurationMs. ⚠️ On 2.5 the
+//   mere PRESENCE of automaticActivityDetection killed sessions with 1007
+//   (#27/#41) — that finding was scoped to 2.5; 3.1's docs list the field as
+//   supported. Never set this while LIVE_MODEL is unset/2.5.
+// TURN_COVERAGE ("TURN_INCLUDES_ONLY_ACTIVITY"): 3.1 defaults to
+//   TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO — every camera frame lands in
+//   every turn's context, where 2.5's default excluded them. Frames dominate
+//   token spend 10:1 (#37), so this both grows context faster and adds
+//   per-turn prompt tokens.
+const THINKING_LEVEL = process.env.THINKING_LEVEL || null;
+const VAD_SILENCE_MS = process.env.VAD_SILENCE_MS !== undefined ? parseInt(process.env.VAD_SILENCE_MS, 10) : null;
+const TURN_COVERAGE = process.env.TURN_COVERAGE || null;
+
 // Validate required env vars at startup
 if (!GEMINI_API_KEY) {
   console.error("FATAL: GEMINI_API_KEY is not set. Set it in your .env file or environment.");
@@ -352,6 +377,40 @@ function describeMicLevel(b64) {
   }
 }
 
+// Sampled RMS of one inbound mic chunk, cheap enough for EVERY chunk.
+//
+// Exists because the 🎯 Response latency metric silently broke on
+// gemini-3.1-flash-live-preview: 2.5 streamed inputTranscription WHILE the
+// user spoke, so "last transcription chunk" approximated speech end — 3.1
+// delivers the whole input transcript batched 2-3ms before the response
+// starts, which made the metric read 2ms and mean nothing. Chunk loudness is
+// model-independent: the client sends a chunk every second regardless, and
+// the last LOUD one is the last one containing speech.
+//
+// Every 4th sample, so a 1s/16k chunk costs ~4k reads — noise-vs-speech needs
+// no more (floor measured ~670-800 RMS, speech 4243+, see #49). The base64
+// decode this adds per chunk is small next to the JSON.parse of the same
+// ~43KB message that already happens on this path.
+function quickRms(b64) {
+  try {
+    const buf = Buffer.from(b64, "base64");
+    const n = Math.floor(buf.length / 2);
+    if (!n) return 0;
+    let sum = 0;
+    let count = 0;
+    for (let i = 0; i < n; i += 4) {
+      const s = buf.readInt16LE(i * 2);
+      sum += s * s;
+      count++;
+    }
+    return Math.round(Math.sqrt(sum / count));
+  } catch {
+    return 0;
+  }
+}
+// Between the measured room-noise floor (~670-800) and real speech (4243+).
+const SPEECH_RMS_MIN = 1500;
+
 function extractAudioData(msg) {
   const parts = msg.serverContent && msg.serverContent.modelTurn && msg.serverContent.modelTurn.parts;
   if (!parts) return undefined;
@@ -594,6 +653,16 @@ wss.on("connection", async (clientWs, req) => {
   // approximation (transcription lags real speech end slightly), but a much
   // closer proxy, and the only one available without client-side changes.
   let lastUserSpeechAt = 0;
+  // Arrival time of the last mic chunk whose RMS cleared SPEECH_RMS_MIN —
+  // the model-independent speech-end proxy backing "Response latency v2"
+  // (see quickRms). Underestimates true speech-end→response by 0..~1s (the
+  // chunk containing the end of speech arrives up to one CHUNK_MS after the
+  // user stopped), which is constant-shaped across model arms, so A/B deltas
+  // are honest even though absolute values read low.
+  let lastLoudChunkAt = 0;
+  // One {type:"heard"} per question: set when the first loud chunk of an
+  // inter-turn window is forwarded, cleared at turn complete.
+  let heardSent = false;
   try {
     // Build dynamic system instruction with live memory, weather + location context
     const sysStart = Date.now();
@@ -651,8 +720,18 @@ wss.on("connection", async (clientWs, req) => {
         },
         // See THINKING_BUDGET above — omitted entirely (not even sent as
         // undefined) when unset, so the model's own default applies exactly
-        // as before this existed.
+        // as before this existed. THINKING_LEVEL (3.1's parameter) wins if
+        // both are set — never set THINKING_BUDGET on the 3.1 arm.
         ...(THINKING_BUDGET !== null ? { thinkingConfig: { thinkingBudget: THINKING_BUDGET } } : {}),
+        ...(THINKING_LEVEL ? { thinkingConfig: { thinkingLevel: THINKING_LEVEL } } : {}),
+        // Env-gated 3.1 knobs — see their declarations up top. Omitted
+        // entirely when unset, exactly like everything else here.
+        ...((TURN_COVERAGE || (VAD_SILENCE_MS !== null && !Number.isNaN(VAD_SILENCE_MS))) ? {
+          realtimeInputConfig: {
+            ...(TURN_COVERAGE ? { turnCoverage: TURN_COVERAGE } : {}),
+            ...(VAD_SILENCE_MS !== null && !Number.isNaN(VAD_SILENCE_MS) ? { automaticActivityDetection: { silenceDurationMs: VAD_SILENCE_MS } } : {}),
+          },
+        } : {}),
         systemInstruction: {
           parts: [{ text: systemInstruction }],
         },
@@ -663,7 +742,7 @@ wss.on("connection", async (clientWs, req) => {
       },
       callbacks: {
         onopen: () => {
-          console.log(`🔗 Connected to Gemini Live API (thinkingBudget=${THINKING_BUDGET === null ? "model default" : THINKING_BUDGET})`);
+          console.log(`🔗 Connected to Gemini Live API (model=${MODEL}, thinking=${THINKING_LEVEL || (THINKING_BUDGET === null ? "default" : THINKING_BUDGET)}, vadSilenceMs=${VAD_SILENCE_MS ?? "default"}, turnCoverage=${TURN_COVERAGE || "default"})`);
           if (clientWs.readyState === WebSocket.OPEN) {
             clientWs.send(JSON.stringify({ type: "connected" }));
           }
@@ -697,7 +776,13 @@ wss.on("connection", async (clientWs, req) => {
                 console.log(`⏱️ Turn latency: ${Date.now() - lastAudioForwardedAt}ms`);
               }
               if (lastUserSpeechAt) {
+                // ⚠️ Broken on 3.1 — inputTranscription arrives batched at
+                // response time there, so this reads ~2ms. Kept because it is
+                // still honest on the 2.5 arm; use v2 below for comparisons.
                 console.log(`🎯 Response latency (last user speech → response start): ${Date.now() - lastUserSpeechAt}ms`);
+              }
+              if (lastLoudChunkAt) {
+                console.log(`🎯 Response latency v2 (last loud mic chunk → response start): ${Date.now() - lastLoudChunkAt}ms`);
               }
             }
             if (audioData) turnAudioChunks++;
@@ -845,6 +930,8 @@ wss.on("connection", async (clientWs, req) => {
               responseInFlight = false;
               userSpeechOpen = false;
               lastUserSpeechAt = 0;
+              lastLoudChunkAt = 0;
+              heardSent = false;
             }
           } catch (err) {
             console.error("Error processing Gemini message:", err.message);
@@ -951,6 +1038,23 @@ wss.on("connection", async (clientWs, req) => {
           if (responseInFlight && Date.now() - responseStartedAt < MAX_SUPPRESS_MS) {
             suppressedChunks++;
             return;
+          }
+          // After the suppression gate on purpose: a chunk the gate discards
+          // never reached Gemini, so it must neither count as "speech Gemini
+          // is answering" (v2 latency) nor trigger a "heard" the pipeline
+          // will not act on.
+          if (quickRms(msg.data) >= SPEECH_RMS_MIN) {
+            lastLoudChunkAt = Date.now();
+            if (!heardSent && !responseInFlight) {
+              // Perceived latency: the client badge otherwise sits on
+              // "Observing" for the full ~1-2s until the first response
+              // audio arrives, which is the window users read as a hang
+              // (#49 — the "40 seconds" complaint was 100% perception).
+              // Old builds ignore unknown message types, so this is safe to
+              // ship server-first.
+              heardSent = true;
+              clientWs.send(JSON.stringify({ type: "heard" }));
+            }
           }
           // `audio`, not the legacy `media` field: media serializes to
           // realtime_input.media_chunks, which gemini-3.1-flash-live-preview

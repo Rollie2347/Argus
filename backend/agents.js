@@ -1033,26 +1033,50 @@ async function findPlacesNearby(args, coords, userId) {
   // Whole-lookup budget, so a chain of dead mirrors cannot hold the turn open
   // indefinitely. Failing honestly at ~11s beats succeeding at 30.
   const OVERPASS_BUDGET_MS = 12000;
+  // Hedged mirrors, not serial fallback. Serially, a dead primary cost its
+  // full 6s timeout before the first mirror even STARTED — a real session
+  // spent 13,782ms hitting 502s in sequence. Now mirror i fires
+  // i×HEDGE_DELAY_MS after the first request, whichever answers OK first
+  // wins, and the losers are abandoned. The healthy path is unchanged:
+  // overpass-api.de typically answers in ~1.2s, before the first hedge
+  // timer expires, so mirrors see no extra traffic unless the primary is
+  // genuinely slow or down. Worst case drops from ~12s of serial timeouts
+  // to ~HEDGE_DELAY_MS×2 + one timeout.
+  const HEDGE_DELAY_MS = 2500;
   const lookupStarted = Date.now();
   try {
-    let res = null;
     let lastStatus = 0;
-    for (const url of endpoints) {
-      const remaining = OVERPASS_BUDGET_MS - (Date.now() - lookupStarted);
-      if (remaining < 1500) break; // not enough left to be worth trying
-      try {
-        const r = await fetch(url, {
-          method: "POST",
-          headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": "Argus/1.0" },
-          body: "data=" + encodeURIComponent(query),
-          signal: AbortSignal.timeout(Math.min(6000, remaining)),
-        });
-        if (r.ok) { res = r; console.log(`   places via ${new URL(url).hostname} — ${Date.now() - lookupStarted}ms`); break; }
-        lastStatus = r.status;
-      } catch (e) {
-        // timeout or network error — try the next mirror
-      }
-    }
+    const res = await new Promise((resolveFirst) => {
+      let settled = false;
+      let pending = endpoints.length;
+      const settle = (r) => {
+        if (r && !settled) { settled = true; resolveFirst(r); }
+        else if (--pending === 0 && !settled) resolveFirst(null);
+      };
+      endpoints.forEach((url, i) => {
+        setTimeout(async () => {
+          const remaining = OVERPASS_BUDGET_MS - (Date.now() - lookupStarted);
+          if (settled || remaining < 1500) return settle(null);
+          try {
+            const r = await fetch(url, {
+              method: "POST",
+              headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": "Argus/1.0" },
+              body: "data=" + encodeURIComponent(query),
+              signal: AbortSignal.timeout(Math.min(6000, remaining)),
+            });
+            if (r.ok) {
+              if (!settled) console.log(`   places via ${new URL(url).hostname} — ${Date.now() - lookupStarted}ms`);
+              return settle(r);
+            }
+            lastStatus = r.status;
+            settle(null);
+          } catch (e) {
+            // timeout or network error — a hedge may still win
+            settle(null);
+          }
+        }, i * HEDGE_DELAY_MS);
+      });
+    });
     if (!res) {
       return {
         error: `places lookup unavailable${lastStatus ? ` (${lastStatus})` : ""}`,

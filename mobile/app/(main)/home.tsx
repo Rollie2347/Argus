@@ -9,7 +9,7 @@ import { useCaptions } from "../../contexts/CaptionsContext";
 import { pcmChunksToWavBase64 } from "../../services/audioGain";
 import type { User } from "../../services/auth";
 
-type Status = "dormant"|"connecting"|"observing"|"speaking"|"error";
+type Status = "dormant"|"connecting"|"observing"|"heard"|"speaking"|"error";
 type Line = { text: string; role: "argus"|"user"|"tool" };
 
 // Tried 400 (down from 1000) to cut mic-buffering delay — made things worse,
@@ -172,6 +172,12 @@ export default function Home() {
   }
   const audioStartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const playbackTokenRef = useRef(0);
+  // Pipelining state: the next burst, already loaded and paused, waiting for
+  // the current one's didJustFinish — and the timer that loads it. Both are
+  // owned by whichever burst is currently playing and invalidated by
+  // playbackTokenRef like everything else in the playback path.
+  const nextBurstRef = useRef<{ sound: Audio.Sound; expectedMs: number } | null>(null);
+  const prepareTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   function addLine(text: string, role: Line["role"]) {
     setLines(prev => [...prev.slice(-20), { text, role }]);
@@ -192,6 +198,14 @@ export default function Home() {
     if (msg.type === "connected") { clearConnectTimeout(); setStatus("observing"); }
     else if (msg.type === "text") { addLine(msg.data, "argus"); setStatus("observing"); clearToolStatus(); }
     else if (msg.type === "tool_event") showToolStatus(TOOL_LABELS[msg.tool] || msg.tool);
+    // Server-side speech-onset ack (RMS gate on the mic chunk, ~50-80ms after
+    // the first loud chunk lands). Without it the badge sits on "Observing"
+    // through the full ~2s until response audio arrives — the window #49
+    // showed users read as a hang. Perception, not speed.
+    // Functional update: handleMsg lives for the whole session, so reading
+    // the `status` state variable here would see the value captured at
+    // connect time (the same stale-closure trap mutedRef exists for).
+    else if (msg.type === "heard") setStatus(s => (s === "observing" ? "heard" : s));
     else if (msg.type === "audio") { argusSpeakingRef.current = true; speakingSinceRef.current = Date.now(); setStatus("speaking"); enqueueAudio(msg.data); }
     // Gemini abandoned the response it was generating (barge-in). Anything
     // still queued belongs to that abandoned turn, so playing it would talk
@@ -357,28 +371,62 @@ export default function Home() {
     playNextInQueue();
   }
 
-  async function playNextInQueue() {
-    if (isPlayingRef.current) return;
-    if (audioQueueRef.current.length === 0) return;
-    // Drain everything that's arrived since the last chunk started playing and
-    // merge it into one WAV. Gemini streams audio in many small pieces; playing
-    // each one as its own Audio.Sound means a load/gap at every chunk boundary,
-    // which is what causes audible jitter/breakup — merging cuts the number of
-    // those boundaries down to roughly one per playback burst.
+  // Drains the queue into one merged WAV and loads it PAUSED — created
+  // paused deliberately: with shouldPlay:true, a stopPlayback() landing
+  // during the load left an already-playing sound nothing tracked while
+  // isPlayingRef was false, so the next burst played on top of it (see the
+  // #33 overlapping-audio bug). Returns null if nothing is queued or the
+  // load was superseded mid-flight.
+  //
+  // Merging exists because Gemini streams audio in many small pieces;
+  // playing each as its own Audio.Sound means a load gap at every chunk
+  // boundary, which is audible as jitter/breakup.
+  async function prepareBurst(): Promise<{ sound: Audio.Sound; expectedMs: number } | null> {
+    if (audioQueueRef.current.length === 0) return null;
     const chunks = audioQueueRef.current;
     audioQueueRef.current = [];
-    isPlayingRef.current = true;
     const myToken = playbackTokenRef.current;
     const pcmBytes = chunks.reduce((sum, b64) => sum + atob(b64).length, 0);
     const expectedMs = (pcmBytes / (24000 * 2)) * 1000; // 24kHz, 16-bit mono
+    try {
+      const wavB64 = pcmChunksToWavBase64(chunks, 24000);
+      const loadStart = Date.now();
+      const { sound } = await Audio.Sound.createAsync({ uri: `data:audio/wav;base64,${wavB64}` }, { shouldPlay: false });
+      // The burst-boundary cost #18/#44 flag. Visible in dev sessions so the
+      // 100-300ms estimate finally gets real numbers.
+      if (__DEV__) console.log(`[argus] burst load ${Date.now() - loadStart}ms for ${Math.round(expectedMs)}ms of audio`);
+      if (playbackTokenRef.current !== myToken) { try { await sound.unloadAsync(); } catch {} return null; }
+      return { sound, expectedMs };
+    } catch {
+      return null;
+    }
+  }
+
+  async function playNextInQueue() {
+    if (isPlayingRef.current) return;
+    if (audioQueueRef.current.length === 0) return;
+    isPlayingRef.current = true;
+    const burst = await prepareBurst();
+    if (!burst) { isPlayingRef.current = false; return; }
+    startBurst(burst);
+  }
+
+  // Plays one prepared burst, and — the pipelining #44 called for — starts
+  // loading the NEXT burst ~350ms before this one ends, so the handoff at
+  // didJustFinish is a playAsync on an already-loaded sound instead of a
+  // serial createAsync. The serial path paid that load (est. 100-300ms, see
+  // the burst-load log) at every boundary, and a long answer is many bursts,
+  // so the cost compounded on exactly the responses that already feel slow.
+  function startBurst(burst: { sound: Audio.Sound; expectedMs: number }) {
+    const myToken = playbackTokenRef.current;
+    const { sound, expectedMs } = burst;
+    soundRef.current = sound;
     let settled = false;
     let watchdog: ReturnType<typeof setTimeout> | null = null;
-    // Safety net for a stuck queue: if an OS audio-session interruption (a
+    // Safety net for a stuck burst: if an OS audio-session interruption (a
     // call, Siri, another app) unloads the sound without ever firing
     // didJustFinish, isPlayingRef previously stayed true forever and every
-    // later burst just piled up in the queue with nothing ever playing again
-    // — reads to the user as "Argus stopped mid-response." Force-advance
-    // after a generous multiple of the clip's own expected duration.
+    // later burst piled up unplayed — reads as "Argus stopped mid-response."
     const finishPlayback = () => {
       if (settled) return;
       settled = true;
@@ -386,32 +434,46 @@ export default function Home() {
       // A superseded burst must not resurrect the queue stopPlayback() just
       // cleared, or reset a flag a newer burst now owns.
       if (playbackTokenRef.current !== myToken) return;
+      // Seamless handoff if the next burst is already loaded.
+      const next = nextBurstRef.current;
+      nextBurstRef.current = null;
+      if (next) { startBurst(next); return; }
       isPlayingRef.current = false;
       playNextInQueue();
     };
-    try {
-      const wavB64 = pcmChunksToWavBase64(chunks, 24000);
-      // Created paused, then started only if this burst is still current.
-      // With shouldPlay:true, a stopPlayback() landing during this await left
-      // an already-playing sound that nothing tracked (soundRef had been
-      // cleared) while isPlayingRef was reset to false — so the next burst
-      // started a second sound on top of it. That was Argus talking over
-      // itself, and neither sound could be stopped.
-      const { sound } = await Audio.Sound.createAsync({ uri: `data:audio/wav;base64,${wavB64}` }, { shouldPlay: false });
-      if (playbackTokenRef.current !== myToken) { try { await sound.unloadAsync(); } catch {} return; }
-      soundRef.current = sound;
-      watchdog = setTimeout(() => {
-        try { sound.unloadAsync(); } catch {}
+    (async () => {
+      try {
+        watchdog = setTimeout(() => {
+          try { sound.unloadAsync(); } catch {}
+          finishPlayback();
+        }, Math.max(6000, expectedMs * 2 + 5000));
+        sound.setOnPlaybackStatusUpdate((st) => {
+          if (!st.isLoaded) { finishPlayback(); return; }
+          if (st.didJustFinish) { sound.unloadAsync(); finishPlayback(); }
+        });
+        await sound.playAsync();
+        if (prepareTimerRef.current) clearTimeout(prepareTimerRef.current);
+        prepareTimerRef.current = setTimeout(async () => {
+          prepareTimerRef.current = null;
+          if (playbackTokenRef.current !== myToken || nextBurstRef.current) return;
+          const next = await prepareBurst();
+          if (!next) return;
+          if (playbackTokenRef.current !== myToken) { try { next.sound.unloadAsync(); } catch {} return; }
+          // The current burst can finish while the next was still loading —
+          // its finish handler then found nothing prepared AND an
+          // already-drained queue, so without this the loaded audio would
+          // simply never play. Start it directly instead of parking it.
+          if (settled || !isPlayingRef.current) {
+            isPlayingRef.current = true;
+            startBurst(next);
+          } else {
+            nextBurstRef.current = next;
+          }
+        }, Math.max(0, expectedMs - 350));
+      } catch (e) {
         finishPlayback();
-      }, Math.max(6000, expectedMs * 2 + 5000));
-      sound.setOnPlaybackStatusUpdate((st) => {
-        if (!st.isLoaded) { finishPlayback(); return; }
-        if (st.didJustFinish) { sound.unloadAsync(); finishPlayback(); }
-      });
-      await sound.playAsync();
-    } catch (e) {
-      finishPlayback();
-    }
+      }
+    })();
   }
 
   // Ramps a sound down before unloading it. Detached from soundRef by the
@@ -439,6 +501,13 @@ export default function Home() {
     playbackTokenRef.current++;
     audioQueueRef.current = [];
     isPlayingRef.current = false;
+    // A preloaded next burst belongs to the response being abandoned — on a
+    // barge-in it is exactly the audio that must NOT play. Cut it instantly
+    // (never faded: it hasn't started, so there is nothing to trail off).
+    if (prepareTimerRef.current) { clearTimeout(prepareTimerRef.current); prepareTimerRef.current = null; }
+    const preloaded = nextBurstRef.current;
+    nextBurstRef.current = null;
+    if (preloaded) { try { preloaded.sound.unloadAsync(); } catch {} }
     const snd = soundRef.current;
     soundRef.current = null;
     if (!snd) return;
@@ -454,7 +523,9 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    if (status !== "observing") { setThinkingHint(null); return; }
+    // "heard" is included so a heard ack whose response never arrives still
+    // degrades into the waiting hints instead of pinning "Heard you" forever.
+    if (status !== "observing" && status !== "heard") { setThinkingHint(null); return; }
     const iv = setInterval(() => {
       const elapsed = Date.now() - lastActivityRef.current;
       if (elapsed > 8000) setThinkingHint("Taking a bit longer than usual, still here...");
@@ -538,7 +609,7 @@ export default function Home() {
   }
 
   const connected = status !== "dormant" && status !== "error";
-  const statusLabel: Record<Status,string> = { dormant:"Dormant", connecting:"Connecting", observing:"Observing", speaking:"Speaking", error:"Error" };
+  const statusLabel: Record<Status,string> = { dormant:"Dormant", connecting:"Connecting", observing:"Observing", heard:"Heard you", speaking:"Speaking", error:"Error" };
 
   return (
     <SafeAreaView style={s.safe}>
