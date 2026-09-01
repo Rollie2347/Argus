@@ -408,8 +408,21 @@ function quickRms(b64) {
     return 0;
   }
 }
-// Between the measured room-noise floor (~670-800) and real speech (4243+).
-const SPEECH_RMS_MIN = 1500;
+// Between the measured room-noise floor (~670-800) and real speech.
+//
+// ⚠️ 1500 was WRONG and shipped broken: across 11 real turns on 2026-09-01 the
+// v2 latency line never fired once, meaning no forwarded chunk ever cleared
+// it — so the {type:"heard"} ack never fired either. It was validated against
+// reference-audio.wav (Gemini's own output, peaking at 85% full scale), which
+// is nothing like a phone mic capturing a person at conversational distance.
+// Same error class as the #43 harness flaw: verified with input that wasn't
+// representative of the real thing.
+//
+// 1100 sits ~1.4x above the measured floor. Biased deliberately toward
+// FALSE POSITIVES: the only consequence of one is the badge reading "Heard
+// you" a moment early, which reverts at turn complete, whereas a false
+// negative silently kills the feature — which is exactly what just happened.
+const SPEECH_RMS_MIN = 1100;
 
 function extractAudioData(msg) {
   const parts = msg.serverContent && msg.serverContent.modelTurn && msg.serverContent.modelTurn.parts;
@@ -660,6 +673,11 @@ wss.on("connection", async (clientWs, req) => {
   // user stopped), which is constant-shaped across model arms, so A/B deltas
   // are honest even though absolute values read low.
   let lastLoudChunkAt = 0;
+  // Loudest forwarded chunk since the last turn ended. Logged at turn
+  // complete so SPEECH_RMS_MIN can be tuned against what this app's users
+  // ACTUALLY produce, rather than against a reference file — the mistake that
+  // shipped the threshold too high in the first place.
+  let windowPeakRms = 0;
   // One {type:"heard"} per question: set when the first loud chunk of an
   // inter-turn window is forwarded, cleared at turn complete.
   let heardSent = false;
@@ -931,6 +949,12 @@ wss.on("connection", async (clientWs, req) => {
               userSpeechOpen = false;
               lastUserSpeechAt = 0;
               lastLoudChunkAt = 0;
+              // Loudness only, never content — same basis as the mic-level
+              // line. Says whether SPEECH_RMS_MIN is calibrated for real
+              // users: a window that peaked below it is one where the ack
+              // could not have fired.
+              console.log(`🎚️ Loudest mic chunk this window: RMS ${windowPeakRms} (threshold ${SPEECH_RMS_MIN}, ack ${heardSent ? "FIRED" : "did not fire"})`);
+              windowPeakRms = 0;
               heardSent = false;
             }
           } catch (err) {
@@ -1043,7 +1067,9 @@ wss.on("connection", async (clientWs, req) => {
           // never reached Gemini, so it must neither count as "speech Gemini
           // is answering" (v2 latency) nor trigger a "heard" the pipeline
           // will not act on.
-          if (quickRms(msg.data) >= SPEECH_RMS_MIN) {
+          const chunkRms = quickRms(msg.data);
+          if (chunkRms > windowPeakRms) windowPeakRms = chunkRms;
+          if (chunkRms >= SPEECH_RMS_MIN) {
             lastLoudChunkAt = Date.now();
             if (!heardSent && !responseInFlight) {
               // Perceived latency: the client badge otherwise sits on
