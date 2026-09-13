@@ -544,7 +544,23 @@ export default function Home() {
     if (!mic.granted) { pushError("Microphone access is off — enable it in Settings"); setStatus("error"); return; }
     setStatus("connecting");
     const myEpoch = ++epochRef.current;
-    mutedRef.current = muted;
+    // Mute is a PER-SESSION control and must be reset here. It used to carry
+    // over: `muted` is React state on a component that stays mounted across
+    // disconnect -> reconnect, while the Switch that sets it is only rendered
+    // `connected ? ... : null` — so muting, tapping ✕, then tapping ◉ again
+    // came back muted with the only affordance having been unmounted in
+    // between. The audio loop then took its `else` branch every iteration
+    // (sleep 200ms, record nothing, send nothing) for the whole session while
+    // camera frames, the greeting and the "Observing" badge all carried on
+    // normally: zero mic chunks, no error, nothing in the logs. Because the
+    // state lives on the mounted component, reconnecting could never clear it
+    // and only killing the app would — which is exactly how it was reported.
+    // Confirmed in production: two sessions from one tester (2026-08-15 and
+    // 2026-09-01) held IDLE frame cadence while Argus was actively streaming
+    // audio, which nextFrameDelay() only does when mutedRef is true; the 183s
+    // one sent zero mic chunks start to finish.
+    setMuted(false);
+    mutedRef.current = false;
     const sock = new ArgusSocket(handleMsg, user.id, user.name, myEpoch);
     socketRef.current = sock;
     sock.connect();
@@ -633,7 +649,7 @@ export default function Home() {
         ) : (
           <View style={[StyleSheet.absoluteFill, s.camPlaceholder]}><Text style={s.eyeIcon}>◉</Text><Text style={s.dormantTxt}>Tap to awaken Argus</Text></View>
         )}
-        <View style={s.badgeFloating}><Text style={[s.badgeTxt, status==="speaking" && {color:"#4a6fa5"}]}>{thinkingHint || statusLabel[status]}</Text></View>
+        <View style={s.badgeFloating}><Text style={[s.badgeTxt, status==="speaking" && {color:"#4a6fa5"}, connected && muted && s.badgeTxtMuted]}>{connected && muted ? "Mic muted — tap Mic to talk" : (thinkingHint || statusLabel[status])}</Text></View>
         {errors.length > 0 && (
           <View style={s.errorStack} pointerEvents="none">
             {errors.map(e => <ErrorToast key={e.id} text={e.text} onDone={() => setErrors(prev => prev.filter(x => x.id !== e.id))} />)}
@@ -695,6 +711,11 @@ const s = StyleSheet.create({
   dormantTxt:{color:"#9e978a",marginTop:12,fontSize:13},
   badgeFloating:{position:"absolute",top:14,alignSelf:"center",backgroundColor:"rgba(8,8,12,0.6)",paddingHorizontal:14,paddingVertical:6,borderRadius:14},
   badgeTxt:{color:"#c9a84c",fontSize:11,letterSpacing:3,textTransform:"uppercase"},
+  // Deliberately the error red, not the normal gold: a muted session is
+  // indistinguishable from a working one otherwise — frames stream, Argus
+  // greets you, the badge says "Observing" — and that is what made this cost
+  // whole sessions before anyone suspected the switch.
+  badgeTxtMuted:{color:"#c44a3f"},
   errorStack:{position:"absolute",top:56,left:16,right:16,alignItems:"center",gap:8},
   errorToast:{backgroundColor:"rgba(196,74,63,0.92)",paddingHorizontal:16,paddingVertical:10,borderRadius:12,maxWidth:"100%"},
   errorToastTxt:{color:"#fff",fontSize:13,textAlign:"center"},
