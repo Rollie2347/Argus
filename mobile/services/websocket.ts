@@ -1,3 +1,5 @@
+import Constants from "expo-constants";
+
 const RAW_BACKEND = process.env.EXPO_PUBLIC_BACKEND_URL;
 if (!RAW_BACKEND) {
   throw new Error("EXPO_PUBLIC_BACKEND_URL is not set — configure mobile/.env before running the app (see mobile/.env.example).");
@@ -5,6 +7,23 @@ if (!RAW_BACKEND) {
 export const BACKEND = RAW_BACKEND;
 const WS_URL = BACKEND.replace("https://","wss://").replace("http://","ws://") + "/ws";
 const WS_SECRET = process.env.EXPO_PUBLIC_WS_SHARED_SECRET || "";
+
+// The binary this session is running, reported on connect purely so the
+// question "which build was that report against?" is answerable from the
+// server logs. This repo has answered it wrong at least five times — #39's
+// correction cost a whole session debugging a fix the device never had, and
+// the same class of mistake produced #53's and #58's stale build claims. The
+// client is the only thing that knows, and it was never saying.
+//
+// Constants.platform.ios.buildNumber is the embedded Info.plist
+// CFBundleVersion: baked into the binary at build time and, unlike
+// expoConfig.ios.buildNumber, not something a manifest can restate. It is
+// null under Expo Go, which is itself the useful answer there.
+const NATIVE_BUILD =
+  (Constants.platform as any)?.ios?.buildNumber ??
+  (Constants.platform as any)?.android?.versionCode ??
+  null;
+const APP_BUILD = `${Constants.expoConfig?.version ?? "?"} (${NATIVE_BUILD ?? "expo-go"})`;
 
 export type MsgHandler = (msg: any) => void;
 
@@ -45,7 +64,7 @@ export class ArgusSocket {
     this.ws = ws;
     ws.onopen = () => {
       if (this.closed) return;
-      try { ws.send(JSON.stringify({ type: "user_id", id: this.userId, name: this.userName, secret: WS_SECRET })); } catch {}
+      try { ws.send(JSON.stringify({ type: "user_id", id: this.userId, name: this.userName, secret: WS_SECRET, build: APP_BUILD })); } catch {}
       this.greetTimer = setTimeout(() => {
         if (this.closed || ws.readyState !== WebSocket.OPEN) return;
         try { ws.send(JSON.stringify({ type: "greet" })); } catch {}
