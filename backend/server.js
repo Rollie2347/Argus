@@ -575,11 +575,47 @@ function quickRms(b64) {
 // Same error class as the #43 harness flaw: verified with input that wasn't
 // representative of the real thing.
 //
-// 1100 sits ~1.4x above the measured floor. Biased deliberately toward
-// FALSE POSITIVES: the only consequence of one is the badge reading "Heard
-// you" a moment early, which reverts at turn complete, whereas a false
-// negative silently kills the feature — which is exactly what just happened.
-const SPEECH_RMS_MIN = 1100;
+// 1100 was ALSO too high, for the same reason one step smaller, and the
+// 2026-09-20 log pull finally has the distribution to settle it. Two
+// populations, cleanly separated:
+//   room tone   — per-chunk `mic RMS` samples: 645-698 holds ~85% of them,
+//                 with a thin tail to 850
+//   real speech — `Loudest mic chunk this window` over every window where
+//                 any chunk was forwarded: minimum 867, p50 960, max 6229
+// At 1100 only 19 of 72 speech windows (26%) cleared the gate, so the
+// {type:"heard"} ack and the v2 response-latency line were both dark on
+// roughly three quarters of real turns — the one metric that can say whether
+// Gemini answered before the user finished, blind, on the arm where v1 is
+// also broken (#55). 800 sits in the gap: above all but two floor samples,
+// below every observed speech window. Still biased toward false positives,
+// which cost a badge flipping early; a false negative costs the metric.
+// Overridable at runtime so it can be retuned with a services update in ~30s
+// instead of a redeploy.
+const SPEECH_RMS_MIN = parseInt(process.env.SPEECH_RMS_MIN || "800", 10);
+
+// The client's opening turn, sent ~1.2s after the socket opens. It used to be
+// the bare word "greet", which left the length entirely to the model — and on
+// gemini-3.1 that produced a MEDIAN 7.9s greeting (p90 12.4s, max 16.1s)
+// against 4.3s on the previous arm.
+//
+// That length is not a cosmetic problem, because the client gates the
+// microphone shut for the whole time Argus is speaking (see the mic gate in
+// #44): measured over 77 real 3.1 sessions, the first mic chunk reaches the
+// server a median of 3.9s and up to 12.7s after connect. So a user who does
+// the natural thing — start talking while Argus is greeting them — has that
+// entire sentence discarded client-side and gets no answer, which is exactly
+// the "Argus doesn't respond when you first speak to it" report.
+//
+// Stated as an instruction in the user turn rather than a system rule
+// because #50 is clear that a system-prompt length rule loses; this one is
+// the immediate instruction being answered, and it constrains only the
+// greeting. The tool ban matters as much as the word count: 3.1 fires
+// parallel get_weather/identify_scene/recall_memory calls on greet (#54) and
+// then narrates all three.
+const GREET_TURN =
+  "The user just opened the app. Greet them in ONE short sentence of at most " +
+  "fifteen words, then stop and wait. Do not call any tools, do not list what " +
+  "you can do, and do not describe what the camera sees.";
 
 function extractAudioData(msg) {
   const parts = msg.serverContent && msg.serverContent.modelTurn && msg.serverContent.modelTurn.parts;
@@ -630,7 +666,12 @@ function waitForAuth(clientWs, timeoutMs = 3000) {
         const msg = JSON.parse(raw.toString());
         if (msg.type !== "user_id" || !msg.id) return;
         if (!validSecret(msg.secret)) return finish(null);
-        finish({ id: String(msg.id).slice(0, 200), name: msg.name ? String(msg.name).slice(0, 200) : "" });
+        // Client build string, reported so a bug report is attributable to a
+        // binary from the logs alone. Untrusted input landing in a log line,
+        // so it is charset-restricted and clamped like every other client
+        // field here rather than logged as received.
+        const build = msg.build ? String(msg.build).replace(/[^\w.() -]/g, "").slice(0, 40) : "";
+        finish({ id: String(msg.id).slice(0, 200), name: msg.name ? String(msg.name).slice(0, 200) : "", build });
       } catch (_) {}
     }
     clientWs.on("message", onMessage);
@@ -765,7 +806,7 @@ wss.on("connection", async (clientWs, req) => {
   }
 
   let userId = auth.id;
-  console.log("👤 User:", userId);
+  console.log("👤 User:", userId, auth.build ? `— client build ${auth.build}` : "— client build unreported");
 
   // Supersede any still-open session for this user before opening a new one.
   const sessionKey = auth.id;
@@ -1156,7 +1197,7 @@ wss.on("connection", async (clientWs, req) => {
     if (greetPending) {
       console.log("👋 Greet arrived before the Gemini session was ready — replaying it");
       try {
-        session.sendClientContent({ turns: [{ role: "user", parts: [{ text: "greet" }] }], turnComplete: true });
+        session.sendClientContent({ turns: [{ role: "user", parts: [{ text: GREET_TURN }] }], turnComplete: true });
       } catch (e) { console.warn("Replayed greet failed:", e.message); }
     }
 
@@ -1260,7 +1301,7 @@ wss.on("connection", async (clientWs, req) => {
           console.log("👤 User:", msg.id);
         } else if (msg.type === "greet" && session) {
           try {
-            session.sendClientContent({ turns: [{ role: "user", parts: [{ text: "greet" }] }], turnComplete: true });
+            session.sendClientContent({ turns: [{ role: "user", parts: [{ text: GREET_TURN }] }], turnComplete: true });
           } catch (e) { console.warn("Greet failed:", e.message); }
         } else if (msg.type === "image" && session) {
           if (typeof msg.data !== "string" || !msg.data || msg.data.length > MAX_IMAGE_B64_LEN) return;
