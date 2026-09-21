@@ -617,6 +617,65 @@ const GREET_TURN =
   "fifteen words, then stop and wait. Do not call any tools, do not list what " +
   "you can do, and do not describe what the camera sees.";
 
+// ── Mic gate ────────────────────────────────────────────────────────────────
+//
+// Whether the user's microphone reaches Gemini while Argus is mid-response.
+// Until 2026-09-20 the answer was a flat no, on both ends: the client dropped
+// the chunk before encoding it, and this server dropped anything that slipped
+// through. That killed the 1:1:1 self-interruption of #44 (0.41 barge-ins per
+// turn down to 0.05 on 3.1) and it worked — but it also means the user talks
+// into a dead microphone for the whole turn, measured at a median 11.6s and
+// p90 23.9s of silence (#59). They repeat themselves, and report it as being
+// cut off. With an 8x barge-in margin in hand, that trade is now the wrong
+// way round.
+//
+// The client no longer drops anything — it sends every chunk and tags whether
+// Argus's audio was actually playing out of the phone's speaker at the time
+// (`gated`). So the decision lives HERE, in one place, tunable without a
+// build. That matters more than it sounds: a client-side constant makes every
+// adjustment cost a ~15 minute build plus a TestFlight round, and this is
+// exactly the kind of threshold that needs tuning against real rooms.
+//
+// Modes:
+//   drop   — never forward during a response. Identical to the old behaviour,
+//            and the safe default while the echo floor is still being
+//            measured on real devices.
+//   time   — forward once the response is MIC_GATE_OPEN_AFTER_MS old. Covers
+//            the initial burst, where echo is loudest and the phone has only
+//            just started playing.
+//   energy — forward only chunks above MIC_GATE_RMS_MIN. Works only if echo
+//            and speech actually occupy different bands.
+//   hybrid — both: past the time bound AND above the level.
+//   open   — forward everything. Diagnostic; this is the pre-#44 behaviour
+//            that produced one barge-in per turn, so do not ship it.
+//
+// MAX_SUPPRESS_MS still backstops all of them: past it every chunk is
+// forwarded regardless, because a turn that never reports completion must
+// never be able to leave the microphone dead for the rest of the session
+// (#33 cost 6 of 21 sessions to exactly that).
+const MIC_GATE_MODE = (process.env.MIC_GATE_MODE || "drop").toLowerCase();
+const MIC_GATE_OPEN_AFTER_MS = parseInt(process.env.MIC_GATE_OPEN_AFTER_MS || "1500", 10);
+// 0 means "unset". An energy mode with no threshold would forward everything,
+// which is `open` by accident — the worst possible failure for this setting —
+// so the modes that need it refuse to open until it is set.
+const MIC_GATE_RMS_MIN = parseInt(process.env.MIC_GATE_RMS_MIN || "0", 10);
+
+// True when a chunk arriving `sinceResponseMs` into a response, at `rms`,
+// should still reach Gemini. Pure function of the config so it can be read
+// and reasoned about without tracing the relay.
+function micGateAllows(rms, sinceResponseMs) {
+  const pastTime = sinceResponseMs >= MIC_GATE_OPEN_AFTER_MS;
+  const loudEnough = MIC_GATE_RMS_MIN > 0 && rms >= MIC_GATE_RMS_MIN;
+  switch (MIC_GATE_MODE) {
+    case "open": return true;
+    case "time": return pastTime;
+    case "energy": return loudEnough;
+    case "hybrid": return pastTime && loudEnough;
+    case "drop":
+    default: return false;
+  }
+}
+
 function extractAudioData(msg) {
   const parts = msg.serverContent && msg.serverContent.modelTurn && msg.serverContent.modelTurn.parts;
   if (!parts) return undefined;
@@ -879,6 +938,33 @@ wss.on("connection", async (clientWs, req) => {
   // One {type:"heard"} per question: set when the first loud chunk of an
   // inter-turn window is forwarded, cleared at turn complete.
   let heardSent = false;
+  // ── Echo floor measurement ────────────────────────────────────────────────
+  //
+  // The number this project has never had. Room tone (645-698) and user
+  // speech (867+) are both well measured, but what Argus's OWN voice reads as
+  // through the mic — with .voiceChat AEC active and playback at gain 1.5 —
+  // has never been sampled once, because those were precisely the chunks both
+  // gates discarded before anything looked at them. Without it there is no
+  // way to know whether an energy threshold can separate Argus from the user
+  // at all, which is what decides the gate design (#44 left the whole
+  // "buffer and flush" idea blocked pending exactly this test).
+  //
+  // Split by whether the phone was actually PLAYING when the chunk was
+  // captured, because the two populations mean different things. The server
+  // flips responseInFlight the moment Gemini starts generating, but the first
+  // audio does not reach the phone for ~1.7s after that — so chunks tagged
+  // not-playing contain no echo by construction and are a control sample of
+  // the room, recorded inside the same window.
+  let echoWhilePlaying = [];
+  let echoBeforePlaying = [];
+  // Chunks the gate let through mid-response. The other half of suppressed:
+  // together they say what the gate actually did this turn.
+  let reopenedChunks = 0;
+  // Whether this client sends chunks while Argus speaks at all. Builds 53 and
+  // earlier drop them on the phone, so the fleet is mixed and several log
+  // lines have to mean different things for each. Set on the first tagged
+  // chunk and never cleared.
+  let clientSendsWhileGated = false;
   try {
     // Build dynamic system instruction with live memory, weather + location context
     const sysStart = Date.now();
@@ -958,7 +1044,7 @@ wss.on("connection", async (clientWs, req) => {
       },
       callbacks: {
         onopen: () => {
-          console.log(`🔗 Connected to Gemini Live API (model=${MODEL}, thinking=${THINKING_LEVEL || (THINKING_BUDGET === null ? "default" : THINKING_BUDGET)}, vadSilenceMs=${VAD_SILENCE_MS ?? "default"}, turnCoverage=${TURN_COVERAGE || "default"})`);
+          console.log(`🔗 Connected to Gemini Live API (model=${MODEL}, thinking=${THINKING_LEVEL || (THINKING_BUDGET === null ? "default" : THINKING_BUDGET)}, vadSilenceMs=${VAD_SILENCE_MS ?? "default"}, turnCoverage=${TURN_COVERAGE || "default"}, micGate=${MIC_GATE_MODE}${MIC_GATE_MODE === "time" || MIC_GATE_MODE === "hybrid" ? `@${MIC_GATE_OPEN_AFTER_MS}ms` : ""}${MIC_GATE_MODE === "energy" || MIC_GATE_MODE === "hybrid" ? `>=${MIC_GATE_RMS_MIN}` : ""})`);
           if (clientWs.readyState === WebSocket.OPEN) {
             clientWs.send(JSON.stringify({ type: "connected" }));
           }
@@ -1136,11 +1222,33 @@ wss.on("connection", async (clientWs, req) => {
                 const spokenMs = Date.now() - turnStartedAt;
                 console.log(`🔇 Turn complete — ${turnAudioChunks} audio chunks over ${spokenMs}ms`);
               }
-              // Chunks dropped this turn. If barge-ins persist while this is
-              // non-zero, something other than the mic stream is triggering
-              // them; if this is zero, the client gate is catching everything
-              // and the server gate is redundant.
-              if (suppressedChunks) console.log(`🔕 Suppressed ${suppressedChunks} mic chunks during response`);
+              // What the gate actually did this turn: how many chunks it held
+              // back, and how many it let through. Before 2026-09-20 the
+              // first number counted only chunks the CLIENT had already let
+              // slip (1-2 a turn); the client now forwards everything, so it
+              // counts the real total and the two are not comparable across
+              // that change.
+              if (suppressedChunks || reopenedChunks) {
+                console.log(`🔕 Mic gate (${MIC_GATE_MODE}): held ${suppressedChunks}, passed ${reopenedChunks} chunk(s) during response`);
+              }
+              // THE echo measurement. `playing` is what Argus's own voice
+              // reads as through the mic with AEC running; `pre-playback` is
+              // the same room in the same window with nothing coming out of
+              // the speaker yet, which is the control. If those two
+              // distributions overlap, no energy threshold can separate
+              // Argus from the user and only a time bound will do.
+              const rmsStat = (xs) => {
+                if (!xs.length) return "n=0";
+                const s = [...xs].sort((a, b) => a - b);
+                const q = (p) => s[Math.min(s.length - 1, Math.floor(s.length * p))];
+                return `n=${s.length} min=${s[0]} p50=${q(0.5)} p90=${q(0.9)} max=${s[s.length - 1]}`;
+              };
+              if (echoWhilePlaying.length || echoBeforePlaying.length) {
+                console.log(`🔊 Mic RMS during response — playing: ${rmsStat(echoWhilePlaying)} | pre-playback: ${rmsStat(echoBeforePlaying)}`);
+              }
+              echoWhilePlaying = [];
+              echoBeforePlaying = [];
+              reopenedChunks = 0;
               lastTurnEndedAt = Date.now();
               turnStartedAt = 0;
               responseInFlight = false;
@@ -1235,10 +1343,16 @@ wss.on("connection", async (clientWs, req) => {
           // A gap much longer than CHUNK_MS means the client stopped sending:
           // the recording loop died, or a gate is stuck shut. Silent before
           // this, and invisible in the chunk counter.
-          // Only meaningful outside a response — during one the gate is
-          // deliberately dropping chunks, so a gap is expected and warning
-          // about it is noise. The first version fired on every single turn.
-          if (!responseInFlight && lastAudioReceivedAt && Date.now() - lastAudioReceivedAt > 5000) {
+          //
+          // The fleet is mixed, so this means two different things. Builds 53
+          // and earlier drop chunks on the phone while Argus speaks, and a
+          // gap is then exactly what the gate is supposed to produce —
+          // warning about it fired on every single turn the first time. A
+          // client that sends while gated has no such excuse: its chunks
+          // should arrive continuously whatever Argus is doing, so a gap
+          // during a response is a real dead mic and the most useful moment
+          // to catch one. clientSendsWhileGated tells the two apart.
+          if ((clientSendsWhileGated || !responseInFlight) && lastAudioReceivedAt && Date.now() - lastAudioReceivedAt > 5000) {
             console.warn(`🎤⚠️ Mic gap: ${Date.now() - lastAudioReceivedAt}ms since last chunk`);
           }
           lastAudioReceivedAt = Date.now();
@@ -1257,15 +1371,32 @@ wss.on("connection", async (clientWs, req) => {
           // Bounded so a turn that never completes cannot silently kill the
           // microphone for the rest of the session — that failure mode cost 6
           // of 21 sessions once already (see CLAUDE.md #33).
+          //
+          // RMS is computed here, ABOVE the gate, rather than below it as it
+          // used to be. Below the gate it can only ever describe chunks that
+          // were already allowed through, which is why the echo floor was
+          // unmeasurable: the interesting population was discarded one line
+          // earlier. It is still only used for v2 latency and the heard ack
+          // after a chunk is forwarded — see below.
+          const chunkRms = quickRms(msg.data);
+          const playing = msg.gated === true;
+          if (playing) clientSendsWhileGated = true;
           if (responseInFlight && Date.now() - responseStartedAt < MAX_SUPPRESS_MS) {
-            suppressedChunks++;
-            return;
+            // Sample first, decide second — the measurement must not depend
+            // on which mode happens to be configured, or turning the gate on
+            // would destroy the data needed to tune it.
+            const bucket = playing ? echoWhilePlaying : echoBeforePlaying;
+            if (bucket.length < 400) bucket.push(chunkRms);
+            if (!micGateAllows(chunkRms, Date.now() - responseStartedAt)) {
+              suppressedChunks++;
+              return;
+            }
+            reopenedChunks++;
           }
           // After the suppression gate on purpose: a chunk the gate discards
           // never reached Gemini, so it must neither count as "speech Gemini
           // is answering" (v2 latency) nor trigger a "heard" the pipeline
           // will not act on.
-          const chunkRms = quickRms(msg.data);
           if (chunkRms > windowPeakRms) windowPeakRms = chunkRms;
           if (chunkRms >= SPEECH_RMS_MIN) {
             lastLoudChunkAt = Date.now();
