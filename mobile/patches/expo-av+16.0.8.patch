@@ -17,10 +17,211 @@ index 7153d28..5e7da86 100644
    
    return [_kernelAudioSessionManagerDelegate setCategory:requiredAudioCategory withOptions:requiredAudioCategoryOptions forModule:self];
 diff --git a/node_modules/expo-av/ios/EXAV/EXAudioSessionManager.m b/node_modules/expo-av/ios/EXAV/EXAudioSessionManager.m
-index 3e768d1..4283b69 100644
+index 3e768d1..795ec2c 100644
 --- a/node_modules/expo-av/ios/EXAV/EXAudioSessionManager.m
 +++ b/node_modules/expo-av/ios/EXAV/EXAudioSessionManager.m
-@@ -254,6 +254,60 @@ EX_REGISTER_SINGLETON_MODULE(AudioSessionManager);
+@@ -13,6 +13,12 @@
+ @property (nonatomic, assign) BOOL sessionIsActive;
+ @property (nonatomic, strong) NSString *activeCategory;
+ @property (nonatomic, assign) AVAudioSessionCategoryOptions activeOptions;
++// Whether the real session reports back the option bits we set. If iOS ever
++// normalises them away, comparing options would call setCategory on every pass
++// and churn the route; this lets drift detection stop trusting them instead.
++@property (nonatomic, assign) BOOL optionsVerifiable;
++// Coalesces route-change resyncs so a burst of notifications is one pass.
++@property (nonatomic, assign) BOOL resyncScheduled;
+ 
+ @property (nonatomic, strong) NSPointerArray *foregroundedModules;
+ @property (nonatomic, strong) NSMapTable<id, NSNumber *> *activeModules;
+@@ -31,6 +37,8 @@ EX_REGISTER_SINGLETON_MODULE(AudioSessionManager);
+ {
+   if ((self = [super init])) {
+     _sessionIsActive = NO;
++    _optionsVerifiable = YES;
++    _resyncScheduled = NO;
+     _foregroundedModules = [NSPointerArray weakObjectsPointerArray];
+     _activeModules = [NSMapTable weakToStrongObjectsMapTable];
+     _moduleCategory = [NSMapTable weakToStrongObjectsMapTable];
+@@ -45,6 +53,14 @@ EX_REGISTER_SINGLETON_MODULE(AudioSessionManager);
+                                              selector:@selector(handleMediaServicesReset:)
+                                                  name:AVAudioSessionMediaServicesWereResetNotification
+                                                object:session];
++    // Argus: a route change (headset, Bluetooth, a call ending, another app
++    // taking and releasing audio) can leave the output on the earpiece or the
++    // category/mode different from what was requested, and nothing else here
++    // ever looked at the real session again. See _realSessionHasDrifted.
++    [[NSNotificationCenter defaultCenter] addObserver:self
++                                             selector:@selector(handleRouteChange:)
++                                                 name:AVAudioSessionRouteChangeNotification
++                                               object:session];
+   }
+   return self;
+ }
+@@ -56,16 +72,110 @@ EX_REGISTER_SINGLETON_MODULE(AudioSessionManager);
+ 
+ - (void)handleAudioSessionInterruption:(NSNotification *)notification
+ {
++  NSNumber *interruptionType = [[notification userInfo] objectForKey:AVAudioSessionInterruptionTypeKey];
++  // Argus: when an interruption begins (a call, Siri, an alarm, another app
++  // taking non-mixable audio) iOS DEACTIVATES the session. This manager never
++  // noticed: _sessionIsActive stayed YES, so every later pass saw "already
++  // active" and skipped setActive:YES for good. AVPlayer then kept "playing"
++  // into a session that was not rendering to hardware — the playhead
++  // advanced, didJustFinish fired, and nothing came out. That is the silent
++  // audio that survived reconnects, because this object outlives every
++  // session.
++  if (interruptionType.unsignedIntegerValue == AVAudioSessionInterruptionTypeBegan) {
++    _sessionIsActive = NO;
++  }
+   for (id foregroundedModule in [_foregroundedModules allObjects]) {
+     [foregroundedModule handleAudioSessionInterruption:notification];
+   }
++  if (interruptionType.unsignedIntegerValue == AVAudioSessionInterruptionTypeEnded) {
++    [self _scheduleResync];
++  }
+ }
+ 
+ - (void)handleMediaServicesReset:(NSNotification *)notification
+ {
++  // Argus: after mediaserverd resets, the real session is back at its
++  // defaults and inactive, but the cached category below still claimed it was
++  // configured — so setCategory was never called again and the app stayed
++  // unable to play until it was killed. Forget everything and rebuild.
++  _activeCategory = nil;
++  _activeOptions = 0;
++  _sessionIsActive = NO;
+   for (id foregroundedModule in [_foregroundedModules allObjects]) {
+     [foregroundedModule handleMediaServicesReset:notification];
+   }
++  [self _scheduleResync];
++}
++
++- (void)handleRouteChange:(NSNotification *)notification
++{
++  [self _scheduleResync];
++}
++
++// Route-change notifications arrive on an arbitrary thread; EXAV's own calls
++// run on the main queue, so resyncing there keeps every session change on one
++// serial queue. Coalesced, because a single device change can post several.
++// Loops cannot form: every step in _updateSessionConfiguration is now a no-op
++// when the real session already matches, so the notification our own repair
++// posts leads to a pass that changes nothing and posts nothing.
++- (void)_scheduleResync
++{
++  @synchronized (self) {
++    if (_resyncScheduled) {
++      return;
++    }
++    _resyncScheduled = YES;
++  }
++  dispatch_async(dispatch_get_main_queue(), ^{
++    @synchronized (self) {
++      self.resyncScheduled = NO;
++    }
++    // Never reconfigure while backgrounded — with no foregrounded module the
++    // requested category falls back to Ambient, which is not a repair.
++    if ([[self.foregroundedModules allObjects] count] == 0) {
++      return;
++    }
++    [self _updateSessionConfiguration];
++  });
++}
++
++// Argus: whether the REAL AVAudioSession no longer matches what this manager
++// last configured. Both caches in this file (the per-module settings in
++// setCategory:forModule: and _activeCategory/_activeOptions in
++// _updateSessionConfiguration) compared requests against earlier requests and
++// never against the session itself — so once anything outside expo-av changed
++// the session, it was never put back.
++- (BOOL)_realSessionHasDrifted
++{
++  if (!_activeCategory) {
++    return NO;
++  }
++  AVAudioSession *session = [AVAudioSession sharedInstance];
++  if (![session.category isEqualToString:_activeCategory]) {
++    return YES;
++  }
++  if (_optionsVerifiable && (session.categoryOptions & _activeOptions) != _activeOptions) {
++    return YES;
++  }
++  if ([_activeCategory isEqualToString:AVAudioSessionCategoryPlayAndRecord]) {
++    if (![session.mode isEqualToString:AVAudioSessionModeVoiceChat]) {
++      return YES;
++    }
++    if ([self _outputIsOnReceiver:session]) {
++      return YES;
++    }
++  }
++  return NO;
++}
++
++- (BOOL)_outputIsOnReceiver:(AVAudioSession *)session
++{
++  for (AVAudioSessionPortDescription *output in session.currentRoute.outputs) {
++    if ([output.portType isEqualToString:AVAudioSessionPortBuiltInReceiver]) {
++      return YES;
++    }
++  }
++  return NO;
+ }
+ 
+ #pragma mark - EXAVScopedModuleDelegate
+@@ -93,7 +203,12 @@ EX_REGISTER_SINGLETON_MODULE(AudioSessionManager);
+     [_activeModules removeObjectForKey:module];
+   }
+ 
+-  if (active != prevActive) {
++  // Argus: `|| (active && !_sessionIsActive)`. A pass used to run only when
++  // the REQUESTED active state flipped — so after iOS deactivated the session
++  // behind this manager's back (interruption), a module asking to be active
++  // while the others already were produced no pass, and nothing ever called
++  // setActive:YES again.
++  if (active != prevActive || (active && !_sessionIsActive)) {
+     NSError *error = [self _updateSessionConfiguration];
+     if (error && active) {
+       [_activeModules removeObjectForKey:module];
+@@ -113,7 +228,13 @@ EX_REGISTER_SINGLETON_MODULE(AudioSessionManager);
+   BOOL oldSettingsWerePresent = overridenCategory && overridenOptions;
+   BOOL newSettingsAreDifferent = !oldSettingsWerePresent || ![overridenCategory isEqualToString:category] || ([overridenOptions unsignedIntegerValue] != options);
+ 
+-  if ([[_foregroundedModules allObjects] containsObject:module] && newSettingsAreDifferent) {
++  // Argus: `|| _realSessionHasDrifted`. EXAV calls this on every promote —
++  // every recorder prepare (once a second) and every burst that starts
++  // playing — but it used to return early whenever the REQUESTED settings
++  // matched the previous request, so no configuration pass ran and a session
++  // that something else had changed was never checked. With this, a drifted
++  // session is repaired at the next burst or within about a second.
++  if ([[_foregroundedModules allObjects] containsObject:module] && (newSettingsAreDifferent || [self _realSessionHasDrifted])) {
+     return [self _updateSessionConfiguration];
+   }
+   return nil;
+@@ -235,11 +356,22 @@ EX_REGISTER_SINGLETON_MODULE(AudioSessionManager);
+   }
+   */
+ 
+-  if (!_activeCategory || ![category isEqualToString:_activeCategory] || options != _activeOptions) {
++  // Argus: also compare against the REAL session, not only against the last
++  // request. The cache alone meant that once anything outside expo-av changed
++  // the category or options, this condition stayed false forever and the
++  // session was never put back — for the life of the app process, since this
++  // is a singleton.
++  BOOL realCategoryDrifted = ![session.category isEqualToString:category];
++  BOOL realOptionsDrifted = _optionsVerifiable && (session.categoryOptions & options) != options;
++  if (!_activeCategory || ![category isEqualToString:_activeCategory] || options != _activeOptions || realCategoryDrifted || realOptionsDrifted) {
+     [session setCategory:category withOptions:options error:&error];
+     if (!error) {
+       _activeOptions = options;
+       _activeCategory = category;
++      // If iOS does not report back the bits we just set, stop comparing
++      // options — otherwise every pass would call setCategory again and churn
++      // the route once a second.
++      _optionsVerifiable = (session.categoryOptions & options) == options;
+     }
+   }
+ 
+@@ -254,6 +386,79 @@ EX_REGISTER_SINGLETON_MODULE(AudioSessionManager);
      }
    }
  
@@ -34,8 +235,13 @@ index 3e768d1..4283b69 100644
 +  // Argus (muffled, .playAndRecord) on the same device and speaker.
 +  // Requesting 48 kHz is a preference, not a guarantee — iOS may still
 +  // refuse under some routes — hence non-fatal handling.
-+  NSError *rateError;
-+  [session setPreferredSampleRate:48000 error:&rateError];
++  // Argus: only when it differs. This now runs from route-change
++  // notifications too, and re-requesting a rate can itself post one — so an
++  // unconditional call here could loop.
++  if (session.preferredSampleRate != 48000) {
++    NSError *rateError;
++    [session setPreferredSampleRate:48000 error:&rateError];
++  }
 +
 +  // VoiceChat mode is what actually engages iOS acoustic echo cancellation
 +  // for simultaneous record+playback; AVAudioSessionModeDefault (expo-av's
@@ -73,7 +279,21 @@ index 3e768d1..4283b69 100644
 +  // cycles, so once _sessionIsActive is YES that branch never runs again —
 +  // but each setCategory: resets the output route back to the .playAndRecord
 +  // default (the earpiece receiver), which is quiet. Not fatal if it fails.
-+  if (_sessionIsActive && [category isEqualToString:AVAudioSessionCategoryPlayAndRecord]) {
++  //
++  // Argus, two changes to the condition:
++  //  - No longer gated on _sessionIsActive. Upstream stopped really
++  //    deactivating the session (see the commented-out block above) but still
++  //    flips that flag to NO, so it routinely claimed "inactive" about a
++  //    session that was active and playing — exactly the passes where
++  //    setCategory: had just reset the route, which were then skipped.
++  //  - Only when the output is actually on the earpiece receiver, judged from
++  //    the REAL route. That makes it a no-op on the pass that its own route
++  //    change triggers (no loop), and it stops forcing the loudspeaker over a
++  //    connected headset or Bluetooth device, which DefaultToSpeaker already
++  //    leaves alone by design.
++  if ([category isEqualToString:AVAudioSessionCategoryPlayAndRecord]
++      && [session.category isEqualToString:AVAudioSessionCategoryPlayAndRecord]
++      && [self _outputIsOnReceiver:session]) {
 +    NSError *overrideError;
 +    [session overrideOutputAudioPort:AVAudioSessionPortOverrideSpeaker error:&overrideError];
 +  }
