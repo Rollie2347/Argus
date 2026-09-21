@@ -951,7 +951,9 @@ const PLACE_CATEGORIES = {
  * which the connection already has from IP geolocation or the user's stored
  * home location.
  */
-async function findPlacesNearby(args, coords, userId) {
+// Where the user is, for any tool that needs coordinates. Returns
+// { lat, lon, origin } or null when there is no location at all.
+async function resolveUserCoords(coords, userId) {
   let lat = coords && Number.isFinite(coords.lat) ? coords.lat : null;
   let lon = coords && Number.isFinite(coords.lon) ? coords.lon : null;
   let origin = "ip";
@@ -979,9 +981,15 @@ async function findPlacesNearby(args, coords, userId) {
     }
   } catch { /* fall through to IP coordinates */ }
 
-  if (lat === null || lon === null) {
+  return lat === null || lon === null ? null : { lat, lon, origin };
+}
+
+async function findPlacesNearby(args, coords, userId) {
+  const loc = await resolveUserCoords(coords, userId);
+  if (!loc) {
     return { error: "no location available", places: [] };
   }
+  const { lat, lon, origin } = loc;
 
   const category = PLACE_CATEGORIES[String(args.category || "").toLowerCase()] || "restaurant";
   // Default ~10 miles, not 3. A 5km default produced zero results on a real
@@ -1309,7 +1317,12 @@ export async function handleToolCall(functionCall, userId, coords) {
     }
 
     case "get_weather": {
-      const weather = await getWeather();
+      // Used to call getWeather() with no arguments, so the tool always
+      // answered for the deploy-time WEATHER_LAT/LON (default Chicago),
+      // whoever asked and wherever they were. Same coordinate choice as
+      // find_places_nearby: home when the user is at home, else IP geo.
+      const loc = await resolveUserCoords(coords, userId);
+      const weather = loc ? await getWeather(loc.lat, loc.lon) : await getWeather();
       if (weather) {
         return weather;
       }
