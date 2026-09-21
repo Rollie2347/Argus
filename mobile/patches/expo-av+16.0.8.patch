@@ -1,5 +1,5 @@
 diff --git a/node_modules/expo-av/ios/EXAV/EXAV.m b/node_modules/expo-av/ios/EXAV/EXAV.m
-index 7153d28..5e7da86 100644
+index 7153d28..751b268 100644
 --- a/node_modules/expo-av/ios/EXAV/EXAV.m
 +++ b/node_modules/expo-av/ios/EXAV/EXAV.m
 @@ -326,6 +326,13 @@ EX_EXPORT_MODULE(ExponentAV);
@@ -16,8 +16,61 @@ index 7153d28..5e7da86 100644
    }
    
    return [_kernelAudioSessionManagerDelegate setCategory:requiredAudioCategory withOptions:requiredAudioCategoryOptions forModule:self];
+@@ -698,6 +705,52 @@ EX_EXPORT_METHOD_AS(setAudioMode,
+   }
+ }
+ 
++// Argus: the REAL AVAudioSession state plus expo-av's own view of it, for the
++// client_log channel. Silent playback (#61-#63) has twice presented with every
++// JS-side probe quiet — sounds load, the playhead runs, nothing is heard — so
++// the only remaining evidence is what the session and route actually were.
++// Port TYPES only, never port names: iOS names Bluetooth devices after their
++// owner ("Rollie's AirPods"), and these lines land in retained Cloud Run logs.
++static NSString *ArgusStripPrefix(NSString *s, NSString *prefix)
++{
++  if (!s) return @"nil";
++  return [s hasPrefix:prefix] ? [s substringFromIndex:prefix.length] : s;
++}
++
++static NSString *ArgusPortTypes(NSArray<AVAudioSessionPortDescription *> *ports)
++{
++  NSMutableArray *types = [NSMutableArray array];
++  for (AVAudioSessionPortDescription *port in ports) {
++    [types addObject:ArgusStripPrefix(port.portType, @"AVAudioSessionPort")];
++  }
++  return types.count ? [types componentsJoinedByString:@","] : @"none";
++}
++
++extern NSDictionary *ArgusAudioSessionEventCounts(void);
++
++EX_EXPORT_METHOD_AS(getAudioSessionDiagnostics,
++                    getAudioSessionDiagnostics:(EXPromiseResolveBlock)resolve
++                    rejecter:(EXPromiseRejectBlock)reject)
++{
++  AVAudioSession *session = [AVAudioSession sharedInstance];
++  NSMutableDictionary *d = [NSMutableDictionary dictionaryWithDictionary:ArgusAudioSessionEventCounts()];
++  d[@"cat"] = ArgusStripPrefix(session.category, @"AVAudioSessionCategory");
++  d[@"opt"] = @(session.categoryOptions);
++  d[@"mode"] = ArgusStripPrefix(session.mode, @"AVAudioSessionMode");
++  d[@"out"] = ArgusPortTypes(session.currentRoute.outputs);
++  d[@"in"] = ArgusPortTypes(session.currentRoute.inputs);
++  d[@"vol"] = @(session.outputVolume);
++  d[@"sr"] = @(session.sampleRate);
++  d[@"oth"] = @(session.isOtherAudioPlaying);
++  d[@"sil"] = @(session.secondaryAudioShouldBeSilencedHint);
++  d[@"en"] = @(_audioIsEnabled);
++  d[@"exav"] = @(_currentAudioSessionMode);
++  d[@"rec"] = @(_allowsAudioRecording);
++  d[@"sim"] = @(_playsInSilentMode);
++  d[@"snd"] = @(_soundDictionary.count);
++  resolve(d);
++}
++
+ #pragma mark - Unified playback API - Audio
+ 
+ EX_EXPORT_METHOD_AS(loadForSound,
 diff --git a/node_modules/expo-av/ios/EXAV/EXAudioSessionManager.m b/node_modules/expo-av/ios/EXAV/EXAudioSessionManager.m
-index 3e768d1..795ec2c 100644
+index 3e768d1..c10e4fc 100644
 --- a/node_modules/expo-av/ios/EXAV/EXAudioSessionManager.m
 +++ b/node_modules/expo-av/ios/EXAV/EXAudioSessionManager.m
 @@ -13,6 +13,12 @@
@@ -33,16 +86,49 @@ index 3e768d1..795ec2c 100644
  
  @property (nonatomic, strong) NSPointerArray *foregroundedModules;
  @property (nonatomic, strong) NSMapTable<id, NSNumber *> *activeModules;
-@@ -31,6 +37,8 @@ EX_REGISTER_SINGLETON_MODULE(AudioSessionManager);
+@@ -23,6 +29,30 @@
+ 
+ @end
+ 
++// Argus diagnostics. Counters of what happened to the session since launch,
++// read by EXAV's getAudioSessionDiagnostics and sent to the server as a
++// client_log. Silent playback has now survived two fixes (#62, #63) with every
++// JS-side probe quiet, so the next occurrence has to say directly what the
++// real session and route were, and what iOS did to them beforehand.
++static __weak EXAudioSessionManager *sArgusManager;
++static NSUInteger sArgusRouteChanges, sArgusLastRouteReason, sArgusInterruptBegan,
++  sArgusInterruptEnded, sArgusMediaResets, sArgusDriftRepairs, sArgusSpeakerOverrides;
++
++NSDictionary *ArgusAudioSessionEventCounts(void)
++{
++  EXAudioSessionManager *manager = sArgusManager;
++  return @{
++    @"rc": @(sArgusRouteChanges),
++    @"rr": @(sArgusLastRouteReason),
++    @"ib": @(sArgusInterruptBegan),
++    @"ie": @(sArgusInterruptEnded),
++    @"ms": @(sArgusMediaResets),
++    @"rp": @(sArgusDriftRepairs),
++    @"ov": @(sArgusSpeakerOverrides),
++    @"act": @(manager ? manager.sessionIsActive : -1),
++  };
++}
++
+ @implementation EXAudioSessionManager
+ 
+ EX_REGISTER_SINGLETON_MODULE(AudioSessionManager);
+@@ -30,7 +60,10 @@ EX_REGISTER_SINGLETON_MODULE(AudioSessionManager);
+ - (instancetype)init
  {
    if ((self = [super init])) {
++    sArgusManager = self;
      _sessionIsActive = NO;
 +    _optionsVerifiable = YES;
 +    _resyncScheduled = NO;
      _foregroundedModules = [NSPointerArray weakObjectsPointerArray];
      _activeModules = [NSMapTable weakToStrongObjectsMapTable];
      _moduleCategory = [NSMapTable weakToStrongObjectsMapTable];
-@@ -45,6 +53,14 @@ EX_REGISTER_SINGLETON_MODULE(AudioSessionManager);
+@@ -45,6 +78,14 @@ EX_REGISTER_SINGLETON_MODULE(AudioSessionManager);
                                               selector:@selector(handleMediaServicesReset:)
                                                   name:AVAudioSessionMediaServicesWereResetNotification
                                                 object:session];
@@ -57,7 +143,7 @@ index 3e768d1..795ec2c 100644
    }
    return self;
  }
-@@ -56,16 +72,110 @@ EX_REGISTER_SINGLETON_MODULE(AudioSessionManager);
+@@ -56,16 +97,116 @@ EX_REGISTER_SINGLETON_MODULE(AudioSessionManager);
  
  - (void)handleAudioSessionInterruption:(NSNotification *)notification
  {
@@ -72,6 +158,9 @@ index 3e768d1..795ec2c 100644
 +  // session.
 +  if (interruptionType.unsignedIntegerValue == AVAudioSessionInterruptionTypeBegan) {
 +    _sessionIsActive = NO;
++    sArgusInterruptBegan++;
++  } else {
++    sArgusInterruptEnded++;
 +  }
    for (id foregroundedModule in [_foregroundedModules allObjects]) {
      [foregroundedModule handleAudioSessionInterruption:notification];
@@ -87,6 +176,7 @@ index 3e768d1..795ec2c 100644
 +  // defaults and inactive, but the cached category below still claimed it was
 +  // configured — so setCategory was never called again and the app stayed
 +  // unable to play until it was killed. Forget everything and rebuild.
++  sArgusMediaResets++;
 +  _activeCategory = nil;
 +  _activeOptions = 0;
 +  _sessionIsActive = NO;
@@ -98,6 +188,8 @@ index 3e768d1..795ec2c 100644
 +
 +- (void)handleRouteChange:(NSNotification *)notification
 +{
++  sArgusRouteChanges++;
++  sArgusLastRouteReason = [[[notification userInfo] objectForKey:AVAudioSessionRouteChangeReasonKey] unsignedIntegerValue];
 +  [self _scheduleResync];
 +}
 +
@@ -168,7 +260,7 @@ index 3e768d1..795ec2c 100644
  }
  
  #pragma mark - EXAVScopedModuleDelegate
-@@ -93,7 +203,12 @@ EX_REGISTER_SINGLETON_MODULE(AudioSessionManager);
+@@ -93,7 +234,12 @@ EX_REGISTER_SINGLETON_MODULE(AudioSessionManager);
      [_activeModules removeObjectForKey:module];
    }
  
@@ -182,22 +274,30 @@ index 3e768d1..795ec2c 100644
      NSError *error = [self _updateSessionConfiguration];
      if (error && active) {
        [_activeModules removeObjectForKey:module];
-@@ -113,7 +228,13 @@ EX_REGISTER_SINGLETON_MODULE(AudioSessionManager);
+@@ -113,8 +259,20 @@ EX_REGISTER_SINGLETON_MODULE(AudioSessionManager);
    BOOL oldSettingsWerePresent = overridenCategory && overridenOptions;
    BOOL newSettingsAreDifferent = !oldSettingsWerePresent || ![overridenCategory isEqualToString:category] || ([overridenOptions unsignedIntegerValue] != options);
  
 -  if ([[_foregroundedModules allObjects] containsObject:module] && newSettingsAreDifferent) {
+-    return [self _updateSessionConfiguration];
 +  // Argus: `|| _realSessionHasDrifted`. EXAV calls this on every promote —
 +  // every recorder prepare (once a second) and every burst that starts
 +  // playing — but it used to return early whenever the REQUESTED settings
 +  // matched the previous request, so no configuration pass ran and a session
 +  // that something else had changed was never checked. With this, a drifted
 +  // session is repaired at the next burst or within about a second.
-+  if ([[_foregroundedModules allObjects] containsObject:module] && (newSettingsAreDifferent || [self _realSessionHasDrifted])) {
-     return [self _updateSessionConfiguration];
++  if ([[_foregroundedModules allObjects] containsObject:module]) {
++    BOOL drifted = !newSettingsAreDifferent && [self _realSessionHasDrifted];
++    if (drifted) {
++      sArgusDriftRepairs++;
++    }
++    if (newSettingsAreDifferent || drifted) {
++      return [self _updateSessionConfiguration];
++    }
    }
    return nil;
-@@ -235,11 +356,22 @@ EX_REGISTER_SINGLETON_MODULE(AudioSessionManager);
+ }
+@@ -235,11 +393,22 @@ EX_REGISTER_SINGLETON_MODULE(AudioSessionManager);
    }
    */
  
@@ -221,7 +321,7 @@ index 3e768d1..795ec2c 100644
      }
    }
  
-@@ -254,6 +386,79 @@ EX_REGISTER_SINGLETON_MODULE(AudioSessionManager);
+@@ -254,6 +423,80 @@ EX_REGISTER_SINGLETON_MODULE(AudioSessionManager);
      }
    }
  
@@ -296,6 +396,7 @@ index 3e768d1..795ec2c 100644
 +      && [self _outputIsOnReceiver:session]) {
 +    NSError *overrideError;
 +    [session overrideOutputAudioPort:AVAudioSessionPortOverrideSpeaker error:&overrideError];
++    sArgusSpeakerOverrides++;
 +  }
 +
    if (error) {

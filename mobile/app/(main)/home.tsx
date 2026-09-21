@@ -2,6 +2,9 @@ import { useState, useEffect, useRef } from "react";
 import { View, Text, TouchableOpacity, StyleSheet, ScrollView, SafeAreaView, Alert, Switch, Animated } from "react-native";
 import { CameraView, useCameraPermissions } from "expo-camera";
 import { Audio } from "expo-av";
+// The raw native module, for getAudioSessionDiagnostics — a method our
+// expo-av patch adds; it is not part of expo-av's public API.
+import ExponentAV from "expo-av/build/ExponentAV";
 import { router } from "expo-router";
 import { getStoredUser, signOut, deleteAccount } from "../../services/auth";
 import { ArgusSocket } from "../../services/websocket";
@@ -262,8 +265,11 @@ export default function Home() {
     // still queued belongs to that abandoned turn, so playing it would talk
     // over — and then repeat ahead of — the replacement response that's about
     // to arrive. Drop it rather than draining it.
-    else if (msg.type === "interrupted") { argusSpeakingRef.current = false; stopPlayback({ fade: true }); setStatus("observing"); }
-    else if (msg.type === "turn_complete") { argusSpeakingRef.current = false; setStatus("observing"); clearToolStatus(); }
+    else if (msg.type === "interrupted") { argusSpeakingRef.current = false; stopPlayback({ fade: true }); setStatus("observing"); reportAudioState("interrupted"); }
+    // Reported at turn_complete because audio arrives faster than real time,
+    // so the reply is normally still PLAYING here — the moment whose route
+    // decides whether anything is heard.
+    else if (msg.type === "turn_complete") { argusSpeakingRef.current = false; setStatus("observing"); clearToolStatus(); reportAudioState("turn"); }
     else if (msg.type === "disconnected") {
       // Reaching here means the backend genuinely dropped the connection —
       // a user-initiated teardown goes through disconnect() and never emits
@@ -321,6 +327,39 @@ export default function Home() {
     try { socketRef.current?.sendClientLog(event, detail); } catch {}
   }
 
+  // The REAL iOS audio session, read natively, as one client_log line.
+  //
+  // Silent playback survived two fixes (#62, #63) with every probe above
+  // quiet: sounds loaded, the playhead ran, nothing was heard. So the session
+  // or its route is what is wrong, and only the session itself can say how.
+  // Fixed key order because NSDictionary's is arbitrary and the server clamps
+  // the line at 300 chars — the fields that decide the question come first:
+  //   cat/mode/opt  category, mode, option bits    out/in  route port TYPES
+  //   vol  output volume   sr  sample rate   oth  other audio playing
+  //   sil  iOS says secondary audio should be silenced
+  //   act  manager's own "session is active" flag   en  expo-av audio enabled
+  //   exav expo-av session mode (0 inactive, 1 muted, 2 active)
+  //   rec/sim  allowsRecording / playsInSilentMode   snd  loaded sounds
+  //   rc/rr  route changes since launch / last reason (1 new device,
+  //          2 device gone, 3 category change, 4 override, 8 config change)
+  //   ib/ie  interruptions began/ended   ms  media services resets
+  //   rp  drift repairs   ov  speaker overrides applied
+  // Absent on builds without the patch (and in Expo Go), so optional.
+  const AUDIO_STATE_KEYS = ["cat", "mode", "opt", "out", "in", "vol", "sr", "oth", "sil", "act", "en", "exav", "rec", "sim", "snd", "rc", "rr", "ib", "ie", "ms", "rp", "ov"];
+  async function reportAudioState(tag: string) {
+    try {
+      const d = await ExponentAV.getAudioSessionDiagnostics?.();
+      if (!d) return;
+      const fmt = (v: any) =>
+        typeof v === "boolean" ? (v ? 1 : 0)
+        : typeof v === "number" && !Number.isInteger(v) ? v.toFixed(2)
+        : v;
+      reportClient("audio_state", [`t:${tag}`, ...AUDIO_STATE_KEYS.map(k => `${k}:${fmt(d[k])}`)].join(" "));
+    } catch (e: any) {
+      reportClient("audio_state_failed", String(e?.message ?? e));
+    }
+  }
+
   // Re-assert the iOS audio session after playback has gone silent.
   //
   // expo-av short-circuits setAudioModeAsync when the mode it is given equals
@@ -341,6 +380,7 @@ export default function Home() {
       await Audio.setAudioModeAsync({ allowsRecordingIOS: false, playsInSilentModeIOS: true });
       await Audio.setAudioModeAsync({ allowsRecordingIOS: true, playsInSilentModeIOS: true });
       reportClient("audio_session_recovered");
+      reportAudioState("recovered");
     } catch (e: any) {
       reportClient("audio_session_recover_failed", String(e?.message ?? e));
       pushError("Audio stopped working — tap ✕ and reconnect");
@@ -373,6 +413,9 @@ export default function Home() {
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         await Audio.setAudioModeAsync({ allowsRecordingIOS: true, playsInSilentModeIOS: true });
+        // Baseline for the session: what "configured" actually looks like
+        // on this phone, to diff a silent turn's line against.
+        reportAudioState("start");
         break;
       } catch (e) {
         if (attempt === 2) throw e;
