@@ -110,5 +110,8 @@ export class ArgusSocket {
   // the server's own responseInFlight is what actually gates.
   sendAudio(b64: string, gated = false) { this.send({ type: "audio", data: b64, gated }); }
   sendImage(b64: string) { this.send({ type: "image", data: b64 }); }
+  // Diagnostics only — an event name and a short detail string, never audio,
+  // image or transcript content. Older servers ignore the unknown type.
+  sendClientLog(event: string, detail?: string) { this.send({ type: "client_log", event, detail }); }
   get ready() { return !this.closed && this.ws?.readyState === WebSocket.OPEN; }
 }

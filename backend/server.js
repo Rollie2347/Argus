@@ -299,7 +299,7 @@ const WS_MAX_CONN_PER_IP = parseInt(process.env.WS_MAX_CONN_PER_IP) || 50;
 // start rejecting real users before the target was actually reached.
 const MAX_GLOBAL_CONCURRENT_SESSIONS = parseInt(process.env.MAX_GLOBAL_CONCURRENT_SESSIONS) || 400;
 const WS_MSG_RATE_LIMIT = 30; // messages/sec/connection
-const ALLOWED_WS_TYPES = new Set(["audio", "image", "user_id", "greet"]);
+const ALLOWED_WS_TYPES = new Set(["audio", "image", "user_id", "greet", "client_log"]);
 const MAX_AUDIO_B64_LEN = 200_000; // ~150KB raw — generous for a 1s 16kHz/16-bit mono chunk
 const MAX_IMAGE_B64_LEN = 3_000_000; // ~2.2MB raw — generous for a quality:0.5 JPEG frame
 const connectionsByIp = new Map();
@@ -1269,6 +1269,17 @@ wss.on("connection", async (clientWs, req) => {
             },
           });
           lastAudioForwardedAt = Date.now();
+        } else if (msg.type === "client_log") {
+          // Client-side diagnostics. The playback path on the phone had no
+          // observability at all in a release build, so "Argus says Speaking
+          // but no audio comes out" could only ever be guessed at. Untrusted
+          // input going straight into a log line: charset-restricted and
+          // clamped like every other client field, and covered by the
+          // existing per-connection message rate limit.
+          if (typeof msg.event !== "string") return;
+          const ev = msg.event.replace(/[^\w.:-]/g, "").slice(0, 40);
+          const detail = typeof msg.detail === "string" ? msg.detail.replace(/[^\w.,:()\/ -]/g, "").slice(0, 160) : "";
+          if (ev) console.warn(`📱 Client [${ev}]${detail ? " " + detail : ""}`);
         } else if (msg.type === "user_id" && msg.id) {
           if (typeof msg.id !== "string" || msg.id.length > 200) return;
           userId = msg.id;

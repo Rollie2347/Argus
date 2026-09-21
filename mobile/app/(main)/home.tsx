@@ -187,6 +187,26 @@ export default function Home() {
   // playbackTokenRef like everything else in the playback path.
   const nextBurstRef = useRef<{ sound: Audio.Sound; expectedMs: number } | null>(null);
   const prepareTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // EVERY loaded sound, so none can be orphaned.
+  //
+  // soundRef and nextBurstRef are single slots, and startBurst used to
+  // overwrite soundRef unconditionally. When two bursts raced (see the
+  // prepare timer below) the displaced one was still LOADED and still
+  // PLAYING, with no reference left anywhere — so stopPlayback could not
+  // stop it and teardownSession could not free it. Each one holds a native
+  // player for the life of the JS context.
+  //
+  // That is the only class of fault that matches "audio worked in other apps,
+  // and it took several disconnect/reconnects to clear": teardownSession
+  // resets every ref this component owns, so anything surviving it is native
+  // or module state, not component state. A leaked player is exactly that.
+  const liveSoundsRef = useRef<Set<Audio.Sound>>(new Set());
+  // Consecutive prepareBurst failures, reset by any success.
+  const burstFailuresRef = useRef(0);
+  async function unloadSound(sound: Audio.Sound) {
+    liveSoundsRef.current.delete(sound);
+    try { await sound.unloadAsync(); } catch {}
+  }
 
   function addLine(text: string, role: Line["role"]) {
     setLines(prev => [...prev.slice(-20), { text, role }]);
@@ -264,6 +284,19 @@ export default function Home() {
   function clearToolStatus() {
     if (toolStatusTimeoutRef.current) { clearTimeout(toolStatusTimeoutRef.current); toolStatusTimeoutRef.current = null; }
     setToolStatus(null);
+  }
+
+  // Client-side diagnostics, sent to the server so they land in Cloud Run
+  // logs alongside the session they belong to.
+  //
+  // The playback path had NO observability in a release build: one silent
+  // catch, one __DEV__-only log, and several unlogged early returns. So
+  // "Argus says Speaking but nothing comes out" was undiagnosable after the
+  // fact, which is the smaller cousin of the missing crash reporting this
+  // project keeps paying for. Loudness, timings and error strings only —
+  // never audio content, never transcript text.
+  function reportClient(event: string, detail?: string) {
+    try { socketRef.current?.sendClientLog(event, detail); } catch {}
   }
 
   function pushError(text: string) {
@@ -417,12 +450,24 @@ export default function Home() {
       const wavB64 = pcmChunksToWavBase64(chunks, 24000);
       const loadStart = Date.now();
       const { sound } = await Audio.Sound.createAsync({ uri: `data:audio/wav;base64,${wavB64}` }, { shouldPlay: false });
+      liveSoundsRef.current.add(sound);
       // The burst-boundary cost #18/#44 flag. Visible in dev sessions so the
       // 100-300ms estimate finally gets real numbers.
       if (__DEV__) console.log(`[argus] burst load ${Date.now() - loadStart}ms for ${Math.round(expectedMs)}ms of audio`);
-      if (playbackTokenRef.current !== myToken) { try { await sound.unloadAsync(); } catch {} return null; }
+      if (playbackTokenRef.current !== myToken) { await unloadSound(sound); return null; }
+      burstFailuresRef.current = 0;
       return { sound, expectedMs };
-    } catch {
+    } catch (e: any) {
+      // This catch used to be `catch { return null; }` — and the queue was
+      // already drained at the top of this function, so a failure here threw
+      // away that audio permanently with no error, no log and no symptom
+      // other than silence. It is the reason this bug class presents as
+      // "Argus says Speaking, captions appear, nothing comes out" instead of
+      // as an error. Report it, and tell the user after a second failure
+      // rather than letting them sit through a mute conversation.
+      burstFailuresRef.current++;
+      reportClient("burst_load_failed", `${burstFailuresRef.current}x ${String(e?.message ?? e).slice(0, 120)}`);
+      if (burstFailuresRef.current >= 2) pushError("Audio playback failed — tap ✕ and reconnect");
       return null;
     }
   }
@@ -445,6 +490,11 @@ export default function Home() {
   function startBurst(burst: { sound: Audio.Sound; expectedMs: number }) {
     const myToken = playbackTokenRef.current;
     const { sound, expectedMs } = burst;
+    // Never displace a still-loaded sound without unloading it. The old code
+    // assigned straight over soundRef, which is how a raced burst became an
+    // untrackable, unstoppable native player (see liveSoundsRef).
+    const displaced = soundRef.current;
+    if (displaced && displaced !== sound) unloadSound(displaced);
     soundRef.current = sound;
     let settled = false;
     let watchdog: ReturnType<typeof setTimeout> | null = null;
@@ -469,12 +519,17 @@ export default function Home() {
     (async () => {
       try {
         watchdog = setTimeout(() => {
-          try { sound.unloadAsync(); } catch {}
+          // Reported, not just recovered. A burst that never reports finishing
+          // means playAsync succeeded while nothing audible happened — the
+          // signature of an audio-session problem rather than a decode one,
+          // and previously indistinguishable from it in a release build.
+          reportClient("burst_watchdog", `expected ${Math.round(expectedMs)}ms`);
+          unloadSound(sound);
           finishPlayback();
         }, Math.max(6000, expectedMs * 2 + 5000));
         sound.setOnPlaybackStatusUpdate((st) => {
-          if (!st.isLoaded) { finishPlayback(); return; }
-          if (st.didJustFinish) { sound.unloadAsync(); finishPlayback(); }
+          if (!st.isLoaded) { liveSoundsRef.current.delete(sound); finishPlayback(); return; }
+          if (st.didJustFinish) { unloadSound(sound); finishPlayback(); }
         });
         await sound.playAsync();
         if (prepareTimerRef.current) clearTimeout(prepareTimerRef.current);
@@ -483,16 +538,32 @@ export default function Home() {
           if (playbackTokenRef.current !== myToken || nextBurstRef.current) return;
           const next = await prepareBurst();
           if (!next) return;
-          if (playbackTokenRef.current !== myToken) { try { next.sound.unloadAsync(); } catch {} return; }
+          if (playbackTokenRef.current !== myToken) { await unloadSound(next.sound); return; }
           // The current burst can finish while the next was still loading —
-          // its finish handler then found nothing prepared AND an
-          // already-drained queue, so without this the loaded audio would
-          // simply never play. Start it directly instead of parking it.
-          if (settled || !isPlayingRef.current) {
+          // its finish handler then finds nothing prepared AND an
+          // already-drained queue, so the loaded audio would never play
+          // unless it is started directly here.
+          //
+          // The test used to be `settled || !isPlayingRef.current`, and the
+          // `settled` half was the bug. Between this burst finishing and
+          // prepareBurst resolving, an arriving chunk can call enqueueAudio ->
+          // playNextInQueue and start a burst of its own. `settled` is true by
+          // then, so this path started a SECOND burst concurrently and
+          // overwrote soundRef — two sounds playing, one of them orphaned and
+          // unstoppable. Short bursts make the window routine: expectedMs for
+          // a single ~180ms chunk clamps the timer below to 0ms, so this runs
+          // immediately after playAsync.
+          //
+          // isPlayingRef alone is the correct test: finishPlayback clears it
+          // exactly when nothing else has taken over, and leaves it set when
+          // something has.
+          if (!isPlayingRef.current) {
             isPlayingRef.current = true;
             startBurst(next);
-          } else {
+          } else if (!nextBurstRef.current) {
             nextBurstRef.current = next;
+          } else {
+            await unloadSound(next.sound);
           }
         }, Math.max(0, expectedMs - 350));
       } catch (e) {
@@ -512,7 +583,7 @@ export default function Home() {
           await new Promise(r => setTimeout(r, FADE_MS / FADE_STEPS));
         }
       } catch { /* sound already gone — unload below is still safe */ }
-      try { await sound.unloadAsync(); } catch {}
+      await unloadSound(sound);
     })();
   }
 
@@ -532,12 +603,20 @@ export default function Home() {
     if (prepareTimerRef.current) { clearTimeout(prepareTimerRef.current); prepareTimerRef.current = null; }
     const preloaded = nextBurstRef.current;
     nextBurstRef.current = null;
-    if (preloaded) { try { preloaded.sound.unloadAsync(); } catch {} }
+    if (preloaded) unloadSound(preloaded.sound);
     const snd = soundRef.current;
     soundRef.current = null;
-    if (!snd) return;
-    if (opts?.fade) fadeOutAndUnload(snd);
-    else { try { snd.unloadAsync(); } catch {} }
+    if (snd) {
+      if (opts?.fade) fadeOutAndUnload(snd);
+      else unloadSound(snd);
+    }
+    // Anything still loaded that the two slots above did not account for.
+    // Normally empty; if it is not, a burst was orphaned and this is the only
+    // thing that can free it — which is what makes a disconnect/reconnect a
+    // real recovery instead of a coin flip.
+    for (const s of Array.from(liveSoundsRef.current)) {
+      if (s !== snd) unloadSound(s);
+    }
   }
 
   useEffect(() => {
