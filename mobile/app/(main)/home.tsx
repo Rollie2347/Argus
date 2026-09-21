@@ -49,6 +49,22 @@ const CONNECT_TIMEOUT_MS = 12000;
 // costs no added latency and cannot overlap the next response.
 const FADE_MS = 120;
 const FADE_STEPS = 6;
+// Upper bound on how much audio is merged into ONE data: URI.
+//
+// prepareBurst used to merge everything queued with no limit. #18 introduced
+// merging to remove a load gap at every chunk boundary, not to merge without
+// bound — and on a long answer the queue can back up behind a slow load, so a
+// single burst could reach several megabytes of base64. AVPlayer is known to
+// be fragile with very large data: URIs, and build 55 produced exactly that
+// failure on a real device: AVPlayerItem -11800 / -12842 sixteen seconds into
+// a fresh launch. Twelve ~180ms chunks is about two seconds of audio, which
+// still collapses the per-chunk boundaries #18 cared about while keeping each
+// URI small enough to be unremarkable.
+const MAX_BURST_CHUNKS = 12;
+// A burst that reports finishing without its position ever moving never
+// rendered anything. That is silent playback, and it is what makes the app
+// look alive while producing nothing.
+const SILENT_BURST_POSITION_MS = 40;
 
 const TOOL_LABELS: Record<string, string> = {
   identify_scene: "Looking at what's around you",
@@ -201,8 +217,14 @@ export default function Home() {
   // resets every ref this component owns, so anything surviving it is native
   // or module state, not component state. A leaked player is exactly that.
   const liveSoundsRef = useRef<Set<Audio.Sound>>(new Set());
-  // Consecutive prepareBurst failures, reset by any success.
+  // prepareBurst failures this session, cleared on connect — NOT reset by a
+  // success. Counting consecutive failures meant an intermittent one among
+  // successes never reached the threshold and the user was never told.
   const burstFailuresRef = useRef(0);
+  // When a burst fails to load, the size to retry the same audio at.
+  const splitBurstRef = useRef(0);
+  // Guards recoverAudioSession against re-entry.
+  const recoveringAudioRef = useRef(false);
   async function unloadSound(sound: Audio.Sound) {
     liveSoundsRef.current.delete(sound);
     try { await sound.unloadAsync(); } catch {}
@@ -297,6 +319,34 @@ export default function Home() {
   // never audio content, never transcript text.
   function reportClient(event: string, detail?: string) {
     try { socketRef.current?.sendClientLog(event, detail); } catch {}
+  }
+
+  // Re-assert the iOS audio session after playback has gone silent.
+  //
+  // expo-av short-circuits setAudioModeAsync when the mode it is given equals
+  // the one it already holds, so calling it with the SAME object after the
+  // session has gone bad is a no-op and fixes nothing — which is why a
+  // reconnect (whose audio loop calls exactly that) was a coin flip rather
+  // than a cure, and why it sometimes took several. Toggling a field first
+  // forces expo-av to push a real change down to AVAudioSession, which also
+  // re-runs the patched category/mode/route setup in EXAV.m (#21/#41):
+  // DefaultToSpeaker, .voiceChat and overrideOutputAudioPort.
+  //
+  // Serialised behind a flag: several bursts can fail at once, and stacking
+  // session changes is its own way to break audio.
+  async function recoverAudioSession() {
+    if (recoveringAudioRef.current) return;
+    recoveringAudioRef.current = true;
+    try {
+      await Audio.setAudioModeAsync({ allowsRecordingIOS: false, playsInSilentModeIOS: true });
+      await Audio.setAudioModeAsync({ allowsRecordingIOS: true, playsInSilentModeIOS: true });
+      reportClient("audio_session_recovered");
+    } catch (e: any) {
+      reportClient("audio_session_recover_failed", String(e?.message ?? e));
+      pushError("Audio stopped working — tap ✕ and reconnect");
+    } finally {
+      recoveringAudioRef.current = false;
+    }
   }
 
   function pushError(text: string) {
@@ -441,8 +491,15 @@ export default function Home() {
   // boundary, which is audible as jitter/breakup.
   async function prepareBurst(): Promise<{ sound: Audio.Sound; expectedMs: number } | null> {
     if (audioQueueRef.current.length === 0) return null;
-    const chunks = audioQueueRef.current;
-    audioQueueRef.current = [];
+    // Take a bounded slice and LEAVE the rest queued, rather than draining
+    // everything. Two reasons: it bounds the data: URI (see MAX_BURST_CHUNKS),
+    // and it means a failure below can only ever put this slice at risk
+    // instead of the whole response.
+    // splitBurstRef is set when a burst failed to load: retry the same audio
+    // in smaller pieces rather than at the size that just failed.
+    const take = splitBurstRef.current > 0 ? Math.min(splitBurstRef.current, MAX_BURST_CHUNKS) : MAX_BURST_CHUNKS;
+    const chunks = audioQueueRef.current.slice(0, take);
+    audioQueueRef.current = audioQueueRef.current.slice(chunks.length);
     const myToken = playbackTokenRef.current;
     const pcmBytes = chunks.reduce((sum, b64) => sum + atob(b64).length, 0);
     const expectedMs = (pcmBytes / (24000 * 2)) * 1000; // 24kHz, 16-bit mono
@@ -451,11 +508,11 @@ export default function Home() {
       const loadStart = Date.now();
       const { sound } = await Audio.Sound.createAsync({ uri: `data:audio/wav;base64,${wavB64}` }, { shouldPlay: false });
       liveSoundsRef.current.add(sound);
+      splitBurstRef.current = 0;
       // The burst-boundary cost #18/#44 flag. Visible in dev sessions so the
       // 100-300ms estimate finally gets real numbers.
       if (__DEV__) console.log(`[argus] burst load ${Date.now() - loadStart}ms for ${Math.round(expectedMs)}ms of audio`);
       if (playbackTokenRef.current !== myToken) { await unloadSound(sound); return null; }
-      burstFailuresRef.current = 0;
       return { sound, expectedMs };
     } catch (e: any) {
       // This catch used to be `catch { return null; }` — and the queue was
@@ -463,11 +520,27 @@ export default function Home() {
       // away that audio permanently with no error, no log and no symptom
       // other than silence. It is the reason this bug class presents as
       // "Argus says Speaking, captions appear, nothing comes out" instead of
-      // as an error. Report it, and tell the user after a second failure
-      // rather than letting them sit through a mute conversation.
+      // as an error.
       burstFailuresRef.current++;
-      reportClient("burst_load_failed", `${burstFailuresRef.current}x ${String(e?.message ?? e).slice(0, 120)}`);
-      if (burstFailuresRef.current >= 2) pushError("Audio playback failed — tap ✕ and reconnect");
+      reportClient(
+        "burst_load_failed",
+        `n=${burstFailuresRef.current} chunks=${chunks.length} ms=${Math.round(expectedMs)} ${String(e?.message ?? e)}`,
+      );
+      // Do not throw the audio away. This is what turned a single decode
+      // failure into a silent conversation: the queue was drained at the top
+      // and the chunks vanished here with no error and no sound. Put them
+      // back so the next attempt retries them — but split first, because a
+      // burst that failed whole may succeed in halves, and a SINGLE chunk
+      // that keeps failing must be dropped or it blocks the queue forever.
+      if (chunks.length > 1) {
+        audioQueueRef.current = chunks.concat(audioQueueRef.current);
+        splitBurstRef.current = Math.max(1, Math.floor(chunks.length / 2));
+      }
+      if (burstFailuresRef.current >= 3) {
+        // Windowed, not consecutive: an intermittent failure among successes
+        // used to reset the counter and never warn. Cleared on connect.
+        pushError("Audio playback is failing — tap ✕ and reconnect");
+      }
       return null;
     }
   }
@@ -498,6 +571,11 @@ export default function Home() {
     soundRef.current = sound;
     let settled = false;
     let watchdog: ReturnType<typeof setTimeout> | null = null;
+    // Furthest the playhead actually reached. A burst that reports finishing
+    // without this ever moving was never rendered — the app looks alive and
+    // produces nothing, which is the failure mode that survives reconnects
+    // and that neither the load-error path nor the watchdog can see.
+    let maxPosition = 0;
     // Safety net for a stuck burst: if an OS audio-session interruption (a
     // call, Siri, another app) unloads the sound without ever firing
     // didJustFinish, isPlayingRef previously stayed true forever and every
@@ -509,6 +587,19 @@ export default function Home() {
       // A superseded burst must not resurrect the queue stopPlayback() just
       // cleared, or reset a flag a newer burst now owns.
       if (playbackTokenRef.current !== myToken) return;
+      // Silent playback: the sound loaded and completed, but nothing ever
+      // came out. Recover rather than carrying on pretending — the audio
+      // session is what is broken, and re-asserting it is the only thing on
+      // this side that can fix it.
+      //
+      // Strictly AFTER the token check. A barge-in cuts a burst off early and
+      // legitimately leaves the playhead near zero, so checking before this
+      // point would fire a session recovery on every interruption — a healthy
+      // event treated as a fault.
+      if (expectedMs > 250 && maxPosition < SILENT_BURST_POSITION_MS) {
+        reportClient("burst_silent", `expected ${Math.round(expectedMs)}ms position ${maxPosition}ms`);
+        recoverAudioSession();
+      }
       // Seamless handoff if the next burst is already loaded.
       const next = nextBurstRef.current;
       nextBurstRef.current = null;
@@ -529,6 +620,7 @@ export default function Home() {
         }, Math.max(6000, expectedMs * 2 + 5000));
         sound.setOnPlaybackStatusUpdate((st) => {
           if (!st.isLoaded) { liveSoundsRef.current.delete(sound); finishPlayback(); return; }
+          if (st.positionMillis > maxPosition) maxPosition = st.positionMillis;
           if (st.didJustFinish) { unloadSound(sound); finishPlayback(); }
         });
         await sound.playAsync();
@@ -665,6 +757,10 @@ export default function Home() {
     // one sent zero mic chunks start to finish.
     setMuted(false);
     mutedRef.current = false;
+    // Per-session playback health. Counting these across sessions would mean
+    // a reconnect inherits the previous session's failures.
+    burstFailuresRef.current = 0;
+    splitBurstRef.current = 0;
     const sock = new ArgusSocket(handleMsg, user.id, user.name, myEpoch);
     socketRef.current = sock;
     sock.connect();
