@@ -4,6 +4,9 @@
 
 const weatherCache = new Map(); // "lat,lon" (rounded) -> { data, time }
 const CACHE_DURATION = 30 * 60 * 1000; // 30 min
+// A forecast a few hours old is far better than none. When a fetch fails, the
+// last good one for that location is served up to this age instead.
+const STALE_LIMIT = 6 * 60 * 60 * 1000; // 6h
 
 export async function getWeather(
   lat = parseFloat(process.env.WEATHER_LAT) || 41.88,
@@ -25,6 +28,16 @@ export async function getWeather(
     // past what every other stage in buildSystemInstruction is bounded by.
     const resp = await fetch(url, { signal: AbortSignal.timeout(3000) });
     const data = await resp.json();
+
+    // Open-Meteo reports failures as JSON — {"error": true, "reason": "..."},
+    // often with a 4xx/429 — and this used to read `current` off that body
+    // unchecked. So for weeks every production fetch died as "Cannot read
+    // properties of undefined (reading 'temperature_2m')", which named the
+    // symptom and threw away the reason. The same URL works from a dev
+    // machine, so the reason is exactly the part that identifies the cause.
+    if (!resp.ok || data.error || !data.current || !data.daily) {
+      throw new Error(`Open-Meteo HTTP ${resp.status}: ${String(data.reason || "no current/daily in response").slice(0, 200)}`);
+    }
 
     const current = data.current;
     const daily = data.daily;
@@ -54,8 +67,9 @@ export async function getWeather(
 
     return weather;
   } catch (err) {
-    console.error("Weather fetch error:", err.message);
-    return null;
+    const stale = cached && now - cached.time < STALE_LIMIT;
+    console.error(`Weather fetch error: ${err.message}${stale ? ` — serving ${Math.round((now - cached.time) / 60000)}min-old forecast` : ""}`);
+    return stale ? cached.data : null;
   }
 }
 
