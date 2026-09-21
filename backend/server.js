@@ -1278,7 +1278,10 @@ wss.on("connection", async (clientWs, req) => {
           // existing per-connection message rate limit.
           if (typeof msg.event !== "string") return;
           const ev = msg.event.replace(/[^\w.:-]/g, "").slice(0, 40);
-          const detail = typeof msg.detail === "string" ? msg.detail.replace(/[^\w.,:()\/ -]/g, "").slice(0, 160) : "";
+          // 300, not 160: the first real capture was an AVFoundation error
+          // that got cut off mid-domain ("... and domain AVFound"), losing
+          // exactly the part that identifies it.
+          const detail = typeof msg.detail === "string" ? msg.detail.replace(/[^\w.,:()\/ -]/g, "").slice(0, 300) : "";
           if (ev) console.warn(`📱 Client [${ev}]${detail ? " " + detail : ""}`);
         } else if (msg.type === "user_id" && msg.id) {
           if (typeof msg.id !== "string" || msg.id.length > 200) return;
