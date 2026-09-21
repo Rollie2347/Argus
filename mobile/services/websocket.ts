@@ -104,7 +104,11 @@ export class ArgusSocket {
     try { this.ws.send(JSON.stringify(payload)); } catch {}
   }
 
-  sendAudio(b64: string) { this.send({ type: "audio", data: b64 }); }
+  // `gated` says Argus's audio was playing out of the speaker when this chunk
+  // was captured, so the server can tell his voice from the user's without
+  // guessing. Older servers ignore the extra field; the flag is advisory and
+  // the server's own responseInFlight is what actually gates.
+  sendAudio(b64: string, gated = false) { this.send({ type: "audio", data: b64, gated }); }
   sendImage(b64: string) { this.send({ type: "image", data: b64 }); }
   get ready() { return !this.closed && this.ws?.readyState === WebSocket.OPEN; }
 }
