@@ -68,6 +68,8 @@ const MAX_BURST_CHUNKS = 12;
 // rendered anything. That is silent playback, and it is what makes the app
 // look alive while producing nothing.
 const SILENT_BURST_POSITION_MS = 40;
+// A burst load pending this long is treated as failed (see prepareBurst).
+const LOAD_TIMEOUT_MS = 3000;
 
 const TOOL_LABELS: Record<string, string> = {
   identify_scene: "Looking at what's around you",
@@ -592,7 +594,30 @@ export default function Home() {
     try {
       const wavB64 = pcmChunksToWavBase64(chunks, 24000);
       const loadStart = Date.now();
-      const { sound } = await Audio.Sound.createAsync({ uri: `data:audio/wav;base64,${wavB64}` }, { shouldPlay: false });
+      // Bounded, because a load can hang forever: build 59 caught the greet's
+      // load never resolving or rejecting (the native player was alive with
+      // no item), and since playNextInQueue awaits it holding isPlayingRef,
+      // every later burst queued behind it and the rest of the session was
+      // silent with captions showing (#64). Normal loads take 100-300ms.
+      const load = Audio.Sound.createAsync({ uri: `data:audio/wav;base64,${wavB64}` }, { shouldPlay: false });
+      let timedOut = false;
+      let loadTimer: ReturnType<typeof setTimeout> | undefined;
+      // A load that completes after being given up on must still be freed.
+      load.then(({ sound }) => { if (timedOut) sound.unloadAsync().catch(() => {}); }, () => {});
+      const { sound } = await Promise.race([
+        load,
+        new Promise<never>((_, reject) => {
+          loadTimer = setTimeout(() => {
+            timedOut = true;
+            // JS never got a handle to the hung sound, so only native code
+            // can free it. Failing it there also rejects `load` above.
+            ExponentAV.argusAbandonStalledLoads?.(LOAD_TIMEOUT_MS - 500)
+              .then((n: number) => reportClient("burst_load_abandoned", `n=${n}`))
+              .catch(() => {});
+            reject(new Error(`load timed out after ${LOAD_TIMEOUT_MS}ms`));
+          }, LOAD_TIMEOUT_MS);
+        }),
+      ]).finally(() => clearTimeout(loadTimer));
       liveSoundsRef.current.add(sound);
       splitBurstRef.current = 0;
       // The burst-boundary cost #18/#44 flag. Visible in dev sessions so the
@@ -641,7 +666,20 @@ export default function Home() {
     // load has already cleared it, and a newer playNextInQueue may have set it
     // again since — clearing it here then let a third call start a burst
     // concurrently with that one.
-    if (!burst) { if (playbackTokenRef.current === myToken) isPlayingRef.current = false; return; }
+    if (!burst) {
+      if (playbackTokenRef.current === myToken) {
+        isPlayingRef.current = false;
+        // A failed load puts its audio back on the queue (split smaller), but
+        // nothing retried it unless more audio happened to arrive — so a
+        // failure near the end of a reply lost the rest of it. Retry here.
+        // Bounded: each failure halves the burst and a single chunk that
+        // fails is dropped rather than requeued.
+        if (audioQueueRef.current.length > 0) {
+          setTimeout(() => { if (playbackTokenRef.current === myToken) playNextInQueue(); }, 100);
+        }
+      }
+      return;
+    }
     startBurst(burst);
   }
 

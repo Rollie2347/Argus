@@ -1,5 +1,5 @@
 diff --git a/node_modules/expo-av/ios/EXAV/EXAV.m b/node_modules/expo-av/ios/EXAV/EXAV.m
-index 7153d28..f56175c 100644
+index 7153d28..57fe4a4 100644
 --- a/node_modules/expo-av/ios/EXAV/EXAV.m
 +++ b/node_modules/expo-av/ios/EXAV/EXAV.m
 @@ -40,6 +40,20 @@ NSString *const EXDidUpdatePlaybackStatusEventName = @"didUpdatePlaybackStatus";
@@ -40,7 +40,7 @@ index 7153d28..f56175c 100644
 @@ -380,6 +401,9 @@ EX_EXPORT_MODULE(ExponentAV);
      return error;
    }
- 
+   
 +  if (_currentAudioSessionMode == EXAVAudioSessionModeInactive) {
 +    sArgusActivations++;
 +  }
@@ -48,14 +48,14 @@ index 7153d28..f56175c 100644
    return nil;
  }
 @@ -402,6 +426,7 @@ EX_EXPORT_MODULE(ExponentAV);
- 
+   
    if (!error) {
      _currentAudioSessionMode = EXAVAudioSessionModeInactive;
 +    sArgusDeactivations++;
    }
    return error;
  }
-@@ -698,6 +723,66 @@ EX_EXPORT_METHOD_AS(setAudioMode,
+@@ -698,6 +723,83 @@ EX_EXPORT_METHOD_AS(setAudioMode,
    }
  }
  
@@ -119,10 +119,27 @@ index 7153d28..f56175c 100644
 +  resolve(d);
 +}
 +
++// Argus #64: fail every sound load pending longer than olderThanMs. Each is
++// failed through expo-av's own load-error path, which removes it and rejects
++// its JS promise. Resolves with how many were abandoned.
++EX_EXPORT_METHOD_AS(argusAbandonStalledLoads,
++                    argusAbandonStalledLoads:(NSNumber *)olderThanMs
++                    resolver:(EXPromiseResolveBlock)resolve
++                    rejecter:(EXPromiseRejectBlock)reject)
++{
++  NSInteger abandoned = 0;
++  for (EXAVPlayerData *data in [[_soundDictionary allValues] copy]) {
++    if ([data argusAbandonLoadIfOlderThan:olderThanMs.doubleValue / 1000.0]) {
++      abandoned++;
++    }
++  }
++  resolve(@(abandoned));
++}
++
  #pragma mark - Unified playback API - Audio
  
  EX_EXPORT_METHOD_AS(loadForSound,
-@@ -945,6 +1030,7 @@ EX_EXPORT_METHOD_AS(startAudioRecording,
+@@ -945,6 +1047,7 @@ EX_EXPORT_METHOD_AS(startAudioRecording,
        NSError *error = [self promoteAudioSessionIfNecessary];
        if (!error) {
          if ([_audioRecorder record]) {
@@ -130,7 +147,7 @@ index 7153d28..f56175c 100644
            _audioRecorderStartTimestamp = (int) (_audioRecorder.deviceCurrentTime * 1000);
            resolve([self _getAudioRecorderStatus]);
          } else {
-@@ -984,6 +1070,7 @@ EX_EXPORT_METHOD_AS(stopAudioRecording,
+@@ -984,6 +1087,7 @@ EX_EXPORT_METHOD_AS(stopAudioRecording,
      _audioRecorderDurationMillis = [self _getDurationMillisOfRecordingAudioRecorder];
      if (_audioRecorder.recording) {
        [_audioRecorder stop];
@@ -139,19 +156,23 @@ index 7153d28..f56175c 100644
        _prevAudioRecorderDurationMillis = 0;
        _audioRecorderStartTimestamp = 0;
 diff --git a/node_modules/expo-av/ios/EXAV/EXAVPlayerData.h b/node_modules/expo-av/ios/EXAV/EXAVPlayerData.h
-index 4f0439e..eed36b0 100644
+index 4f0439e..95506c8 100644
 --- a/node_modules/expo-av/ios/EXAV/EXAVPlayerData.h
 +++ b/node_modules/expo-av/ios/EXAV/EXAVPlayerData.h
-@@ -34,4 +34,7 @@
+@@ -34,4 +34,11 @@
  
  - (void)cleanup;
  
 +// Argus #64 diagnostics: this player's state as one compact token.
 +- (NSString *)argusPlayerSnapshot;
 +
++// Argus #64: when the current load began, and a way to fail it if it has hung.
++@property (nonatomic, assign) CFAbsoluteTime argusLoadStartedAt;
++- (BOOL)argusAbandonLoadIfOlderThan:(NSTimeInterval)seconds;
++
  @end
 diff --git a/node_modules/expo-av/ios/EXAV/EXAVPlayerData.m b/node_modules/expo-av/ios/EXAV/EXAVPlayerData.m
-index 6f6998d..b63b01f 100644
+index 6f6998d..23e628d 100644
 --- a/node_modules/expo-av/ios/EXAV/EXAVPlayerData.m
 +++ b/node_modules/expo-av/ios/EXAV/EXAVPlayerData.m
 @@ -2,6 +2,82 @@
@@ -237,7 +258,15 @@ index 6f6998d..b63b01f 100644
  
  // This struct is passed between the MTAudioProcessingTap callbacks.
  typedef struct AVAudioTapProcessorContext {
-@@ -203,6 +279,12 @@ NSString *const EXAVPlayerDataObserverMetadataKeyPath = @"timedMetadata";
+@@ -138,6 +214,7 @@ NSString *const EXAVPlayerDataObserverMetadataKeyPath = @"timedMetadata";
+ 
+ - (void)_loadNewPlayer
+ {
++  _argusLoadStartedAt = CFAbsoluteTimeGetCurrent();
+   NSArray *cookies = [[NSHTTPCookieStorage sharedHTTPCookieStorage] cookies];
+   NSURL *assetUrl = _url;
+   [self warnIfNonExistingFile:assetUrl];
+@@ -203,6 +280,12 @@ NSString *const EXAVPlayerDataObserverMetadataKeyPath = @"timedMetadata";
          self.player.muted = self.isMuted;
          [self _updateLooping:self.isLooping];
  
@@ -250,7 +279,49 @@ index 6f6998d..b63b01f 100644
          [self _tryPlayPlayerWithRateAndMuteIfNecessary];
  
          self.isLoaded = YES;
-@@ -954,6 +1036,63 @@ NSString *const EXAVPlayerDataObserverMetadataKeyPath = @"timedMetadata";
+@@ -890,11 +973,41 @@ NSString *const EXAVPlayerDataObserverMetadataKeyPath = @"timedMetadata";
+           }
+           strongSelf.metadataUpdateCallback(metadata);
+         }
++      } else if (!strongSelf.isLoaded
++                 && [keyPath isEqualToString:EXAVPlayerDataObserverStatusKeyPath]
++                 && [object isKindOfClass:[AVPlayerItem class]]
++                 && ((AVPlayerItem *)object).status == AVPlayerItemStatusFailed) {
++        // Argus #64: an item that fails during load is dequeued by
++        // AVQueuePlayer before this block runs, so the currentItem check
++        // above no longer matches it and the failure was dropped. The load
++        // then never finished or failed: the JS promise hung forever and
++        // every later burst queued behind it, in silence, for the rest of the
++        // session (build 59: player alive, currentItem nil, no error).
++        NSError *itemError = ((AVPlayerItem *)object).error;
++        [strongSelf _finishLoadWithError:[NSString stringWithFormat:@"Argus: dequeued AVPlayerItem failed during load, code %li domain %@ %@",
++                                          (long)itemError.code, itemError.domain, itemError.localizedFailureReason ?: @""]];
+       }
+     }
+   });
+ }
+ 
++// Argus #64: fail a load that has been pending too long, through the normal
++// failure path (which removes the sound and rejects the JS promise). JS has no
++// key for a sound whose load never resolved, so it cannot unload it itself.
++- (BOOL)argusAbandonLoadIfOlderThan:(NSTimeInterval)seconds
++{
++  if (_isLoaded || !_loadFinishBlock || _argusLoadStartedAt <= 0) {
++    return NO;
++  }
++  NSTimeInterval elapsed = CFAbsoluteTimeGetCurrent() - _argusLoadStartedAt;
++  if (elapsed < seconds) {
++    return NO;
++  }
++  [self _finishLoadWithError:[NSString stringWithFormat:@"Argus: load abandoned after %.0fms, player %@",
++                              elapsed * 1000, [self argusPlayerSnapshot]]];
++  return YES;
++}
++
+ #pragma mark - Sample Buffer Callbacks & AudioMix Tap
+ 
+ - (void)setSampleBufferCallback:(EXAudioSampleCallback *)sampleBufferCallback
+@@ -954,6 +1067,63 @@ NSString *const EXAVPlayerDataObserverMetadataKeyPath = @"timedMetadata";
    }
  }
  
