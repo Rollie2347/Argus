@@ -258,6 +258,163 @@ app.post("/api/user/:userId/profile", async (req, res) => {
   }
 });
 
+// ============================================================
+// MARKETING REDIRECT COUNTER  —  GET /g/:slug
+// ============================================================
+//
+// Per-post click attribution for the social pipeline in marketing/.
+// App Store Connect's own campaign tokens are useless at this volume: Apple
+// suppresses any metric with fewer than 5 events in the range, and organic
+// social is expected to produce single-digit installs per batch. This route is
+// the only instrument that reports a real number for a single post.
+//
+// THREE HARD CONSTRAINTS, because this is a public unauthenticated endpoint on
+// the same service that runs the Gemini Live sessions:
+//
+//   1. It never touches Firestore. Writing per-click to Firestore would put an
+//      unauthenticated, floodable write path on the same client that
+//      reserveGlobalSlot uses on every WS connect — measured at 98-241ms and
+//      already the largest Firestore cost in the connection-open path (#42).
+//      A bot hammering a bio link must not be able to slow down session setup.
+//      Structured stdout lines cost microseconds and cannot contend.
+//   2. The handler is fully synchronous and does no I/O. It cannot await, so
+//      it cannot hold an event-loop turn away from the relay, where CPU is the
+//      binding constraint (#36).
+//   3. It is mounted OUTSIDE the /api rate limiter. That limiter protects the
+//      claim/profile endpoints; applying it here would mean a successful post
+//      from one mobile carrier's CGNAT egress starts 429-ing real people on
+//      their way to the App Store. Logging has its own budget below, and
+//      exceeding it drops the LOG LINE, never the redirect.
+//
+// Reading the numbers back:
+//   gcloud logging read 'resource.type=cloud_run_revision
+//     AND resource.labels.service_name=argus
+//     AND jsonPayload.event="marketing_click"' \
+//     --project agus-488919 --freshness=7d \
+//     --format="value(jsonPayload.slug)" | sort | uniq -c | sort -rn
+//
+// Cloud Run's default log retention is 30 days, which is enough here:
+// marketing/TRACKING.md takes a reading at 48h and again at day 7 and
+// copies both into its log table, which is the durable record.
+
+const APPSTORE_URL = process.env.APPSTORE_URL || "https://apps.apple.com/app/apple-store/id6761696821";
+// Apple GENERATES this the first time a campaign link is created in ASC — it
+// cannot be invented, and the Campaigns tab only appears once the app has
+// analytics data. Until it exists, ct is dropped rather than sent on its own:
+// a ct without a pt attributes nothing, so appending it would only make the
+// destination look tracked when it isn't.
+const APPSTORE_PROVIDER_TOKEN = process.env.APPSTORE_PROVIDER_TOKEN || null;
+const REDIRECT_LOG_PER_IP_PER_MIN = parseInt(process.env.REDIRECT_LOG_PER_IP_PER_MIN) || 60;
+const REDIRECT_LOG_GLOBAL_PER_MIN = parseInt(process.env.REDIRECT_LOG_GLOBAL_PER_MIN) || 600;
+
+// Slugs are minted by marketing/scripts/make-slideshow.mjs as
+// "<deck-id>-<tt|ig>". Anything else still redirects, it just isn't counted.
+const SLUG_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
+// Apple allows a wider punctuation set in ct, but this value is interpolated
+// into a URL, so it is deliberately narrowed to characters that cannot change
+// that URL's shape.
+const CT_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,29}$/;
+
+const redirectLogHits = new Map();
+let redirectLogWindow = { resetAt: 0, count: 0, dropped: 0 };
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, entry] of redirectLogHits) if (now > entry.resetAt) redirectLogHits.delete(ip);
+}, 60_000).unref();
+
+// Budgets the LOG LINE, not the redirect. False means "redirect this visitor
+// normally, just don't write a line for them", so a flood degrades the
+// measurement and never the user's path to the App Store.
+function allowRedirectLog(ip) {
+  const now = Date.now();
+  if (now > redirectLogWindow.resetAt) {
+    if (redirectLogWindow.dropped > 0) {
+      console.log(JSON.stringify({
+        severity: "WARNING", event: "marketing_click_log_dropped",
+        dropped: redirectLogWindow.dropped,
+        message: `🔗⚠️ Dropped ${redirectLogWindow.dropped} click log lines in the last minute (budget)`,
+      }));
+    }
+    redirectLogWindow = { resetAt: now + 60_000, count: 0, dropped: 0 };
+  }
+  if (redirectLogWindow.count >= REDIRECT_LOG_GLOBAL_PER_MIN) { redirectLogWindow.dropped++; return false; }
+
+  let entry = redirectLogHits.get(ip);
+  if (!entry || now > entry.resetAt) { entry = { count: 0, resetAt: now + 60_000 }; redirectLogHits.set(ip, entry); }
+  entry.count++;
+  if (entry.count > REDIRECT_LOG_PER_IP_PER_MIN) { redirectLogWindow.dropped++; return false; }
+
+  redirectLogWindow.count++;
+  return true;
+}
+
+// Referrer is attacker-controlled and lands in a log line, so it is parsed
+// rather than trusted — URL parsing rejects control characters outright, which
+// closes the log-injection angle even though JSON encoding already would.
+//
+// Only the ORIGIN is kept, never the path or query. A full referrer URL can
+// carry query parameters, and this app's App Privacy declaration answers "No"
+// to collecting data for tracking; the origin is the only genuinely useful bit
+// (which platform sent them) and carries none of that risk. To capture full
+// referrers instead, return u.href here.
+//
+// Expect null most of the time: a tap on a TikTok or Instagram bio link is a
+// top-level navigation from an in-app browser and generally sends no Referer
+// at all. That is normal, not a bug — the SLUG already carries the platform
+// (-tt / -ig), which is exactly why it does.
+function referrerOrigin(raw) {
+  if (!raw) return null;
+  try {
+    const u = new URL(String(raw).slice(0, 500));
+    if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+    return `${u.protocol}//${u.host}`.slice(0, 120);
+  } catch { return null; }
+}
+
+function marketingRedirect(req, res) {
+  const rawSlug = String(req.params.slug || "");
+  const slug = rawSlug.toLowerCase();
+  const known = SLUG_RE.test(slug);
+
+  const rawCt = String(req.query.c || "");
+  const ct = CT_RE.test(rawCt) ? rawCt : null;
+
+  let dest = APPSTORE_URL;
+  if (APPSTORE_PROVIDER_TOKEN && ct) {
+    const sep = dest.includes("?") ? "&" : "?";
+    dest += `${sep}pt=${encodeURIComponent(APPSTORE_PROVIDER_TOKEN)}&ct=${encodeURIComponent(ct)}&mt=8`;
+  }
+
+  // 302 and no-store, deliberately. A 301 is cached by the browser and by any
+  // intermediary, and every cached hit is a tap this endpoint never sees —
+  // biasing LTPM downward over a post's life, silently, and in the direction
+  // that makes the content look worse than it was.
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate");
+  res.redirect(302, dest);
+
+  // Everything below runs after the response. It cannot delay or fail it.
+  if (!allowRedirectLog(getClientIp(req))) return;
+  console.log(JSON.stringify({
+    severity: "INFO",
+    event: "marketing_click",
+    slug: known ? slug : null,
+    rawSlug: known ? undefined : rawSlug.slice(0, 80),
+    ct,
+    ref: referrerOrigin(req.get("referer")),
+    ts: new Date().toISOString(),
+    message: `🔗 Click: ${known ? slug : "(unrecognised slug)"}${ct ? ` [${ct}]` : ""}`,
+  }));
+}
+
+// An unknown or malformed slug still lands on the App Store. A typo'd bio link
+// that loses attribution costs one post's data; one that 404s in front of
+// every viewer costs the post.
+app.get("/g/:slug", marketingRedirect);
+app.get("/g", (req, res) => {
+  res.set("Cache-Control", "no-store");
+  res.redirect(302, APPSTORE_URL);
+});
+
 // Serve frontend. index.html gets the WS shared secret injected server-side
 // (from env, never committed) so the public demo page can open an authorized
 // connection without the secret ever living in git history.
