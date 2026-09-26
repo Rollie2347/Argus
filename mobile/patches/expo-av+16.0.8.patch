@@ -1,8 +1,29 @@
 diff --git a/node_modules/expo-av/ios/EXAV/EXAV.m b/node_modules/expo-av/ios/EXAV/EXAV.m
-index 7153d28..751b268 100644
+index 7153d28..f56175c 100644
 --- a/node_modules/expo-av/ios/EXAV/EXAV.m
 +++ b/node_modules/expo-av/ios/EXAV/EXAV.m
-@@ -326,6 +326,13 @@ EX_EXPORT_MODULE(ExponentAV);
+@@ -40,6 +40,20 @@ NSString *const EXDidUpdatePlaybackStatusEventName = @"didUpdatePlaybackStatus";
+ 
+ NSString *const EXDidUpdateMetadataEventName = @"didUpdateMetadata";
+ 
++// Argus #64: what expo-av itself does to the session underneath the players.
++// The recorder cycles prepare/record/stop/unload every second, and each stop
++// runs demoteAudioSessionIfPossible — which deactivates the whole session
++// (pausing every player) whenever nothing happens to be playing right then,
++// e.g. between two bursts. None of that is visible in the session's own
++// category/mode/route, which is all audio_state could show.
++static NSUInteger sArgusDeactivations, sArgusActivations;
++static CFAbsoluteTime sArgusRecordStartedAt, sArgusRecordStoppedAt;
++
++static NSInteger ArgusMsSince(CFAbsoluteTime t)
++{
++  return t > 0 ? (NSInteger)((CFAbsoluteTimeGetCurrent() - t) * 1000) : -1;
++}
++
+ @interface EXAV ()
+ 
+ @property (nonatomic, weak) RCTBridge *bridge;
+@@ -326,6 +340,13 @@ EX_EXPORT_MODULE(ExponentAV);
    if (_allowsAudioRecording) {
      // Bluetooth input is only available when recording is allowed
      requiredAudioCategoryOptions = requiredAudioCategoryOptions | AVAudioSessionCategoryOptionAllowBluetooth;
@@ -16,7 +37,25 @@ index 7153d28..751b268 100644
    }
    
    return [_kernelAudioSessionManagerDelegate setCategory:requiredAudioCategory withOptions:requiredAudioCategoryOptions forModule:self];
-@@ -698,6 +705,52 @@ EX_EXPORT_METHOD_AS(setAudioMode,
+@@ -380,6 +401,9 @@ EX_EXPORT_MODULE(ExponentAV);
+     return error;
+   }
+ 
++  if (_currentAudioSessionMode == EXAVAudioSessionModeInactive) {
++    sArgusActivations++;
++  }
+   _currentAudioSessionMode = audioSessionModeRequired;
+   return nil;
+ }
+@@ -402,6 +426,7 @@ EX_EXPORT_MODULE(ExponentAV);
+ 
+   if (!error) {
+     _currentAudioSessionMode = EXAVAudioSessionModeInactive;
++    sArgusDeactivations++;
+   }
+   return error;
+ }
+@@ -698,6 +723,66 @@ EX_EXPORT_METHOD_AS(setAudioMode,
    }
  }
  
@@ -42,6 +81,8 @@ index 7153d28..751b268 100644
 +}
 +
 +extern NSDictionary *ArgusAudioSessionEventCounts(void);
++extern NSDictionary *ArgusRenderCounts(void);
++
 +
 +EX_EXPORT_METHOD_AS(getAudioSessionDiagnostics,
 +                    getAudioSessionDiagnostics:(EXPromiseResolveBlock)resolve
@@ -63,12 +104,216 @@ index 7153d28..751b268 100644
 +  d[@"rec"] = @(_allowsAudioRecording);
 +  d[@"sim"] = @(_playsInSilentMode);
 +  d[@"snd"] = @(_soundDictionary.count);
++  [d addEntriesFromDictionary:ArgusRenderCounts()];
++  d[@"da"] = @(sArgusDeactivations);
++  d[@"pa"] = @(sArgusActivations);
++  d[@"recg"] = @(_audioRecorder ? (_audioRecorder.isRecording ? 1 : 0) : -1);
++  d[@"rsa"] = @(ArgusMsSince(sArgusRecordStartedAt));
++  d[@"rso"] = @(ArgusMsSince(sArgusRecordStoppedAt));
++  NSMutableArray *players = [NSMutableArray array];
++  for (EXAVPlayerData *data in [_soundDictionary allValues]) {
++    if (players.count == 3) break;
++    [players addObject:[data argusPlayerSnapshot]];
++  }
++  d[@"pl"] = players.count ? [players componentsJoinedByString:@","] : @"none";
 +  resolve(d);
 +}
 +
  #pragma mark - Unified playback API - Audio
  
  EX_EXPORT_METHOD_AS(loadForSound,
+@@ -945,6 +1030,7 @@ EX_EXPORT_METHOD_AS(startAudioRecording,
+       NSError *error = [self promoteAudioSessionIfNecessary];
+       if (!error) {
+         if ([_audioRecorder record]) {
++          sArgusRecordStartedAt = CFAbsoluteTimeGetCurrent();
+           _audioRecorderStartTimestamp = (int) (_audioRecorder.deviceCurrentTime * 1000);
+           resolve([self _getAudioRecorderStatus]);
+         } else {
+@@ -984,6 +1070,7 @@ EX_EXPORT_METHOD_AS(stopAudioRecording,
+     _audioRecorderDurationMillis = [self _getDurationMillisOfRecordingAudioRecorder];
+     if (_audioRecorder.recording) {
+       [_audioRecorder stop];
++      sArgusRecordStoppedAt = CFAbsoluteTimeGetCurrent();
+     }
+       _prevAudioRecorderDurationMillis = 0;
+       _audioRecorderStartTimestamp = 0;
+diff --git a/node_modules/expo-av/ios/EXAV/EXAVPlayerData.h b/node_modules/expo-av/ios/EXAV/EXAVPlayerData.h
+index 4f0439e..eed36b0 100644
+--- a/node_modules/expo-av/ios/EXAV/EXAVPlayerData.h
++++ b/node_modules/expo-av/ios/EXAV/EXAVPlayerData.h
+@@ -34,4 +34,7 @@
+ 
+ - (void)cleanup;
+ 
++// Argus #64 diagnostics: this player's state as one compact token.
++- (NSString *)argusPlayerSnapshot;
++
+ @end
+diff --git a/node_modules/expo-av/ios/EXAV/EXAVPlayerData.m b/node_modules/expo-av/ios/EXAV/EXAVPlayerData.m
+index 6f6998d..b63b01f 100644
+--- a/node_modules/expo-av/ios/EXAV/EXAVPlayerData.m
++++ b/node_modules/expo-av/ios/EXAV/EXAVPlayerData.m
+@@ -2,6 +2,82 @@
+ 
+ #import <EXAV/EXAVPlayerData.h>
+ #import <MobileCoreServices/MobileCoreServices.h>
++#import <stdatomic.h>
++#import <math.h>
++
++// Argus render meter (#64). Every AVPlayerItem gets a pass-through
++// MTAudioProcessingTap that measures the samples the player actually hands to
++// the output, process-wide. Silent turns load, run their playhead and finish
++// without a single error, so the one question left is whether the players
++// produce samples at all: rendered-and-audible frames on a silent turn put the
++// loss below the players (mixer / voice processing), zero puts it in them.
++// Globals, not per-tap storage, so nothing can be read after a tap is freed.
++static _Atomic uint64_t sArgusRenderFrames, sArgusAudibleFrames;
++static _Atomic uint32_t sArgusRenderPeak; // peak |sample| x 10000, reset on read
++static _Atomic uint32_t sArgusTapsInstalled, sArgusTapsFailed;
++static _Atomic int32_t sArgusTapIsFloat = -1, sArgusTapSampleRate;
++
++NSDictionary *ArgusRenderCounts(void)
++{
++  return @{
++    @"rf": @(atomic_load(&sArgusRenderFrames)),
++    @"rl": @(atomic_load(&sArgusAudibleFrames)),
++    @"pk": @(atomic_exchange(&sArgusRenderPeak, 0)),
++    @"ti": @(atomic_load(&sArgusTapsInstalled)),
++    @"tf": @(atomic_load(&sArgusTapsFailed)),
++    @"fl": @(atomic_load(&sArgusTapIsFloat)),
++    @"tsr": @(atomic_load(&sArgusTapSampleRate)),
++  };
++}
++
++static void ArgusMeterInit(MTAudioProcessingTapRef tap, void *clientInfo, void **tapStorageOut)
++{
++  *tapStorageOut = NULL;
++}
++
++static void ArgusMeterFinalize(MTAudioProcessingTapRef tap) {}
++
++static void ArgusMeterPrepare(MTAudioProcessingTapRef tap, CMItemCount maxFrames, const AudioStreamBasicDescription *format)
++{
++  atomic_store(&sArgusTapIsFloat, (format->mFormatID == kAudioFormatLinearPCM && (format->mFormatFlags & kAudioFormatFlagIsFloat) && format->mBitsPerChannel == 32) ? 1 : 0);
++  atomic_store(&sArgusTapSampleRate, (int32_t)format->mSampleRate);
++}
++
++static void ArgusMeterUnprepare(MTAudioProcessingTapRef tap) {}
++
++static void ArgusMeterProcess(MTAudioProcessingTapRef tap, CMItemCount numberFrames, MTAudioProcessingTapFlags flags, AudioBufferList *bufferListInOut, CMItemCount *numberFramesOut, MTAudioProcessingTapFlags *flagsOut)
++{
++  // Pass-through: the audio is fetched into the caller's buffers and never
++  // modified. Everything below only reads it.
++  if (MTAudioProcessingTapGetSourceAudio(tap, numberFrames, bufferListInOut, flagsOut, NULL, numberFramesOut) != noErr) {
++    return;
++  }
++  CMItemCount frames = *numberFramesOut;
++  atomic_fetch_add(&sArgusRenderFrames, (uint64_t)frames);
++  if (atomic_load(&sArgusTapIsFloat) != 1 || bufferListInOut->mNumberBuffers == 0) {
++    return;
++  }
++  const AudioBuffer *buffer = &bufferListInOut->mBuffers[0];
++  const float *samples = (const float *)buffer->mData;
++  UInt32 count = buffer->mDataByteSize / sizeof(float);
++  if (!samples || count == 0) {
++    return;
++  }
++  float peak = 0;
++  double sumSquares = 0;
++  for (UInt32 i = 0; i < count; i++) {
++    float v = fabsf(samples[i]);
++    if (v > peak) peak = v;
++    sumSquares += (double)v * v;
++  }
++  // -60 dBFS: speech clears it easily, digital silence never does.
++  if (sqrt(sumSquares / count) > 0.001) {
++    atomic_fetch_add(&sArgusAudibleFrames, (uint64_t)frames);
++  }
++  uint32_t scaled = (uint32_t)(fminf(peak, 1.0f) * 10000);
++  uint32_t current = atomic_load(&sArgusRenderPeak);
++  while (scaled > current && !atomic_compare_exchange_weak(&sArgusRenderPeak, &current, scaled)) {}
++}
+ 
+ // This struct is passed between the MTAudioProcessingTap callbacks.
+ typedef struct AVAudioTapProcessorContext {
+@@ -203,6 +279,12 @@ NSString *const EXAVPlayerDataObserverMetadataKeyPath = @"timedMetadata";
+         self.player.muted = self.isMuted;
+         [self _updateLooping:self.isLooping];
+ 
++        // Argus #64: meter every player before it can start. Skipped when
++        // expo-av's own sample callback owns the item's audio mix.
++        if (!self.sampleBufferCallback) {
++          [self _argusInstallRenderMeter];
++        }
++
+         [self _tryPlayPlayerWithRateAndMuteIfNecessary];
+ 
+         self.isLoaded = YES;
+@@ -954,6 +1036,63 @@ NSString *const EXAVPlayerDataObserverMetadataKeyPath = @"timedMetadata";
+   }
+ }
+ 
++- (void)_argusInstallRenderMeter
++{
++  AVPlayerItem *item = [_player currentItem];
++  AVAssetTrack *track = item.tracks.firstObject.assetTrack;
++  if (!track || item.audioMix) {
++    atomic_fetch_add(&sArgusTapsFailed, 1);
++    return;
++  }
++  AVMutableAudioMixInputParameters *parameters = [AVMutableAudioMixInputParameters audioMixInputParametersWithTrack:track];
++  MTAudioProcessingTapCallbacks callbacks;
++  memset(&callbacks, 0, sizeof(callbacks));
++  callbacks.version = kMTAudioProcessingTapCallbacksVersion_0;
++  callbacks.clientInfo = NULL;
++  callbacks.init = ArgusMeterInit;
++  callbacks.finalize = ArgusMeterFinalize;
++  callbacks.prepare = ArgusMeterPrepare;
++  callbacks.unprepare = ArgusMeterUnprepare;
++  callbacks.process = ArgusMeterProcess;
++  MTAudioProcessingTapRef tap;
++  if (!parameters || MTAudioProcessingTapCreate(kCFAllocatorDefault, &callbacks, kMTAudioProcessingTapCreationFlag_PostEffects, &tap) != noErr) {
++    atomic_fetch_add(&sArgusTapsFailed, 1);
++    return;
++  }
++  parameters.audioTapProcessor = tap;
++  AVMutableAudioMix *mix = [AVMutableAudioMix audioMix];
++  mix.inputParameters = @[parameters];
++  [item setAudioMix:mix];
++  CFRelease(tap);
++  atomic_fetch_add(&sArgusTapsInstalled, 1);
++}
++
++// One compact token per player for the #64 diagnostics line:
++// timeControlStatus/rate/volume/muted/itemStatus/waitReason/positionMs
++//   timeControlStatus 0 paused, 1 waiting, 2 playing
++//   itemStatus 0 unknown, 1 ready, 2 failed
++//   waitReason - none, s minimize stalls, e evaluating buffering, n no item, o other
++- (NSString *)argusPlayerSnapshot
++{
++  AVQueuePlayer *player = _player;
++  if (!player) {
++    return @"x";
++  }
++  NSString *why = @"-";
++  AVPlayerWaitingReason reason = player.reasonForWaitingToPlay;
++  if (reason) {
++    if ([reason isEqualToString:AVPlayerWaitingToMinimizeStallsReason]) why = @"s";
++    else if ([reason isEqualToString:AVPlayerWaitingWhileEvaluatingBufferingRateReason]) why = @"e";
++    else if ([reason isEqualToString:AVPlayerWaitingWithNoItemToPlayReason]) why = @"n";
++    else why = @"o";
++  }
++  AVPlayerItem *item = player.currentItem;
++  double positionMs = item ? CMTimeGetSeconds(item.currentTime) * 1000 : -1;
++  return [NSString stringWithFormat:@"%ld/%.2f/%.2f/%d/%ld/%@/%.0f",
++          (long)player.timeControlStatus, player.rate, player.volume, player.muted ? 1 : 0,
++          (long)(item ? item.status : -1), why, isnan(positionMs) ? -1 : positionMs];
++}
++
+ - (void)uninstallTap
+ {
+   AVPlayerItem *item = [_player currentItem];
 diff --git a/node_modules/expo-av/ios/EXAV/EXAudioSessionManager.m b/node_modules/expo-av/ios/EXAV/EXAudioSessionManager.m
 index 3e768d1..c10e4fc 100644
 --- a/node_modules/expo-av/ios/EXAV/EXAudioSessionManager.m

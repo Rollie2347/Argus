@@ -228,6 +228,12 @@ export default function Home() {
   const splitBurstRef = useRef(0);
   // Guards recoverAudioSession against re-entry.
   const recoveringAudioRef = useRef(false);
+  // #64 diagnostic, set per session by the server (DIAG_MIC_PAUSE_DURING_PLAYBACK):
+  // record nothing while Argus's audio is queued or playing, so the recorder
+  // (and the voice processing it brings up under .voiceChat) never runs
+  // underneath a player. If silent replies stop with this on, the recorder is
+  // implicated; if they don't, it is cleared.
+  const micPauseDuringPlaybackRef = useRef(false);
   async function unloadSound(sound: Audio.Sound) {
     liveSoundsRef.current.delete(sound);
     try { await sound.unloadAsync(); } catch {}
@@ -249,7 +255,7 @@ export default function Home() {
     // and its leftover audio played on top of the current session's audio.
     if (msg.epoch !== undefined && msg.epoch !== epochRef.current) return;
     lastActivityRef.current = Date.now();
-    if (msg.type === "connected") { clearConnectTimeout(); setStatus("observing"); }
+    if (msg.type === "connected") { clearConnectTimeout(); setStatus("observing"); micPauseDuringPlaybackRef.current = msg.micPauseDuringPlayback === true; }
     else if (msg.type === "text") { addLine(msg.data, "argus"); setStatus("observing"); clearToolStatus(); }
     else if (msg.type === "tool_event") showToolStatus(TOOL_LABELS[msg.tool] || msg.tool);
     // Server-side speech-onset ack (RMS gate on the mic chunk, ~50-80ms after
@@ -269,7 +275,7 @@ export default function Home() {
     // Reported at turn_complete because audio arrives faster than real time,
     // so the reply is normally still PLAYING here — the moment whose route
     // decides whether anything is heard.
-    else if (msg.type === "turn_complete") { argusSpeakingRef.current = false; setStatus("observing"); clearToolStatus(); reportAudioState("turn"); }
+    else if (msg.type === "turn_complete") { argusSpeakingRef.current = false; setStatus("observing"); clearToolStatus(); reportAudioState("turn").then(() => reportRender("turn")); }
     else if (msg.type === "disconnected") {
       // Reaching here means the backend genuinely dropped the connection —
       // a user-initiated teardown goes through disconnect() and never emits
@@ -360,6 +366,42 @@ export default function Home() {
     }
   }
 
+  // #64: whether the players actually produced sound, and what expo-av did
+  // to the session underneath them. A separate line from audio_state, which
+  // already sits near the server's 300-char clamp.
+  //   rf/rl  frames the players rendered / frames above -60 dBFS, since the
+  //          last report (tsr is their sample rate)
+  //   pk     peak rendered sample x10000 since the previous native read
+  //   da/pa  session deactivations / activations by expo-av, since last report
+  //   b/ems  bursts started / audio ms they carried, this reply
+  //   ti/tf  meters installed / failed since launch   fl  float format (1)
+  //   recg   recorder recording now   rsa/rso  ms since it last started/stopped
+  //   mp     mic paused during playback (server toggle)
+  //   pl     per player: timeControl/rate/vol/muted/itemStatus/wait/posMs
+  // A silent reply with rl close to rf means the players rendered speech and
+  // it was lost below them; rl near 0 means the players themselves were silent.
+  const RENDER_KEYS = ["tsr", "pk", "ti", "tf", "fl", "recg", "rsa", "rso", "pl"];
+  const renderBaseRef = useRef<Record<string, number>>({});
+  const replyBurstsRef = useRef({ n: 0, ms: 0 });
+  async function reportRender(tag: string) {
+    try {
+      const d = await ExponentAV.getAudioSessionDiagnostics?.();
+      if (!d || typeof d.rf !== "number") return;
+      const base = renderBaseRef.current;
+      const delta = (k: string) => d[k] - (base[k] ?? 0);
+      const parts = [
+        `t:${tag}`, `rf:${delta("rf")}`, `rl:${delta("rl")}`, `da:${delta("da")}`, `pa:${delta("pa")}`,
+        `b:${replyBurstsRef.current.n}`, `ems:${Math.round(replyBurstsRef.current.ms)}`,
+        `mp:${micPauseDuringPlaybackRef.current ? 1 : 0}`,
+        ...RENDER_KEYS.map(k => `${k}:${d[k]}`),
+      ];
+      renderBaseRef.current = { rf: d.rf, rl: d.rl, da: d.da, pa: d.pa };
+      reportClient("audio_render", parts.join(" "));
+    } catch (e: any) {
+      reportClient("audio_render_failed", String(e?.message ?? e));
+    }
+  }
+
   // Re-assert the iOS audio session after playback has gone silent.
   //
   // expo-av short-circuits setAudioModeAsync when the mode it is given equals
@@ -415,7 +457,7 @@ export default function Home() {
         await Audio.setAudioModeAsync({ allowsRecordingIOS: true, playsInSilentModeIOS: true });
         // Baseline for the session: what "configured" actually looks like
         // on this phone, to diff a silent turn's line against.
-        reportAudioState("start");
+        reportAudioState("start").then(() => reportRender("start"));
         break;
       } catch (e) {
         if (attempt === 2) throw e;
@@ -423,7 +465,8 @@ export default function Home() {
       }
     }
     while (loopRef.current && epochRef.current === myEpoch && socketRef.current?.ready) {
-      if (!mutedRef.current) {
+      const pausedForPlayback = micPauseDuringPlaybackRef.current && (isPlayingRef.current || audioQueueRef.current.length > 0 || argusIsSpeaking());
+      if (!mutedRef.current && !pausedForPlayback) {
         const rec = new Audio.Recording();
         try {
           await rec.prepareToRecordAsync({ android: { extension: ".wav", outputFormat: Audio.AndroidOutputFormat.DEFAULT, audioEncoder: Audio.AndroidAudioEncoder.DEFAULT, sampleRate: 16000, numberOfChannels: 1, bitRate: 128000 }, ios: { extension: ".wav", audioQuality: Audio.IOSAudioQuality.LOW, sampleRate: 16000, numberOfChannels: 1, bitRate: 128000, linearPCMBitDepth: 16, linearPCMIsBigEndian: false, linearPCMIsFloat: false }, web: {} });
@@ -592,8 +635,13 @@ export default function Home() {
     if (isPlayingRef.current) return;
     if (audioQueueRef.current.length === 0) return;
     isPlayingRef.current = true;
+    const myToken = playbackTokenRef.current;
     const burst = await prepareBurst();
-    if (!burst) { isPlayingRef.current = false; return; }
+    // Only release the flag if it is still ours. A stopPlayback() during the
+    // load has already cleared it, and a newer playNextInQueue may have set it
+    // again since — clearing it here then let a third call start a burst
+    // concurrently with that one.
+    if (!burst) { if (playbackTokenRef.current === myToken) isPlayingRef.current = false; return; }
     startBurst(burst);
   }
 
@@ -612,6 +660,9 @@ export default function Home() {
     const displaced = soundRef.current;
     if (displaced && displaced !== sound) unloadSound(displaced);
     soundRef.current = sound;
+    replyBurstsRef.current.n++;
+    replyBurstsRef.current.ms += expectedMs;
+    const firstOfReply = replyBurstsRef.current.n === 1;
     let settled = false;
     let watchdog: ReturnType<typeof setTimeout> | null = null;
     // Furthest the playhead actually reached. A burst that reports finishing
@@ -649,6 +700,11 @@ export default function Home() {
       if (next) { startBurst(next); return; }
       isPlayingRef.current = false;
       playNextInQueue();
+      // Nothing left to play: the whole reply's render total is in.
+      if (!isPlayingRef.current && audioQueueRef.current.length === 0) {
+        reportRender("drained");
+        replyBurstsRef.current = { n: 0, ms: 0 };
+      }
     };
     (async () => {
       try {
@@ -667,6 +723,12 @@ export default function Home() {
           if (st.didJustFinish) { unloadSound(sound); finishPlayback(); }
         });
         await sound.playAsync();
+        // The success path: the player state while its playhead should be
+        // moving, once per reply. A silent reply reports no error anywhere,
+        // so this is the moment to look at.
+        if (firstOfReply) {
+          setTimeout(() => { if (playbackTokenRef.current === myToken) reportRender("play"); }, 400);
+        }
         if (prepareTimerRef.current) clearTimeout(prepareTimerRef.current);
         prepareTimerRef.current = setTimeout(async () => {
           prepareTimerRef.current = null;
@@ -732,6 +794,7 @@ export default function Home() {
     playbackTokenRef.current++;
     audioQueueRef.current = [];
     isPlayingRef.current = false;
+    replyBurstsRef.current = { n: 0, ms: 0 };
     // A preloaded next burst belongs to the response being abandoned — on a
     // barge-in it is exactly the audio that must NOT play. Cut it instantly
     // (never faded: it hasn't started, so there is nothing to trail off).
@@ -804,6 +867,7 @@ export default function Home() {
     // a reconnect inherits the previous session's failures.
     burstFailuresRef.current = 0;
     splitBurstRef.current = 0;
+    micPauseDuringPlaybackRef.current = false;
     const sock = new ArgusSocket(handleMsg, user.id, user.name, myEpoch);
     socketRef.current = sock;
     sock.connect();

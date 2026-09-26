@@ -659,6 +659,13 @@ const MIC_GATE_OPEN_AFTER_MS = parseInt(process.env.MIC_GATE_OPEN_AFTER_MS || "1
 // which is `open` by accident — the worst possible failure for this setting —
 // so the modes that need it refuse to open until it is set.
 const MIC_GATE_RMS_MIN = parseInt(process.env.MIC_GATE_RMS_MIN || "0", 10);
+// #64 diagnostic, off unless set to 1: tells build-59+ clients to record
+// nothing while Argus's audio is queued or playing, so the recorder (and the
+// voice processing .voiceChat brings up with it) never runs under a player.
+// If silent replies stop with this on, the recorder is implicated. In `drop`
+// mode the user can't be heard mid-reply anyway, but the playing-RMS
+// silent-turn detector goes blind while it is on, so judge by ear.
+const DIAG_MIC_PAUSE_DURING_PLAYBACK = process.env.DIAG_MIC_PAUSE_DURING_PLAYBACK === "1";
 
 // True when a chunk arriving `sinceResponseMs` into a response, at `rms`,
 // should still reach Gemini. Pure function of the config so it can be read
@@ -1044,9 +1051,9 @@ wss.on("connection", async (clientWs, req) => {
       },
       callbacks: {
         onopen: () => {
-          console.log(`🔗 Connected to Gemini Live API (model=${MODEL}, thinking=${THINKING_LEVEL || (THINKING_BUDGET === null ? "default" : THINKING_BUDGET)}, vadSilenceMs=${VAD_SILENCE_MS ?? "default"}, turnCoverage=${TURN_COVERAGE || "default"}, micGate=${MIC_GATE_MODE}${MIC_GATE_MODE === "time" || MIC_GATE_MODE === "hybrid" ? `@${MIC_GATE_OPEN_AFTER_MS}ms` : ""}${MIC_GATE_MODE === "energy" || MIC_GATE_MODE === "hybrid" ? `>=${MIC_GATE_RMS_MIN}` : ""})`);
+          console.log(`🔗 Connected to Gemini Live API (model=${MODEL}, thinking=${THINKING_LEVEL || (THINKING_BUDGET === null ? "default" : THINKING_BUDGET)}, vadSilenceMs=${VAD_SILENCE_MS ?? "default"}, turnCoverage=${TURN_COVERAGE || "default"}, micGate=${MIC_GATE_MODE}${MIC_GATE_MODE === "time" || MIC_GATE_MODE === "hybrid" ? `@${MIC_GATE_OPEN_AFTER_MS}ms` : ""}${MIC_GATE_MODE === "energy" || MIC_GATE_MODE === "hybrid" ? `>=${MIC_GATE_RMS_MIN}` : ""}${DIAG_MIC_PAUSE_DURING_PLAYBACK ? ", micPauseDuringPlayback=1" : ""})`);
           if (clientWs.readyState === WebSocket.OPEN) {
-            clientWs.send(JSON.stringify({ type: "connected" }));
+            clientWs.send(JSON.stringify({ type: "connected", micPauseDuringPlayback: DIAG_MIC_PAUSE_DURING_PLAYBACK }));
           }
         },
 
