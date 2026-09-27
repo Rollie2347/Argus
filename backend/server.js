@@ -683,6 +683,15 @@ function micGateAllows(rms, sinceResponseMs) {
   }
 }
 
+// Audio chunks smaller than this are dropped instead of forwarded (#64).
+// 96 bytes is 2ms of 24kHz 16-bit mono, far below anything audible. The
+// phone wraps each reply's FIRST chunk in a WAV on its own, and a near-empty
+// one is unplayable: AVFoundation fails the item with -11800/-12842. On
+// builds 54-59 that failure also hung the load and silenced the rest of the
+// session; build 60 recovers from it, but only a server-side filter protects
+// the builds already installed. Dropping 2ms or less loses no sound.
+const MIN_AUDIO_CHUNK_BYTES = 96;
+
 function extractAudioData(msg) {
   const parts = msg.serverContent && msg.serverContent.modelTurn && msg.serverContent.modelTurn.parts;
   if (!parts) return undefined;
@@ -918,6 +927,8 @@ wss.on("connection", async (clientWs, req) => {
   // nothing for 36s".
   let turnStartedAt = 0;
   let turnAudioChunks = 0;
+  // Byte sizes of chunks dropped this turn by MIN_AUDIO_CHUNK_BYTES.
+  let droppedAudioSizes = [];
   let lastTurnEndedAt = 0;
   let userSpeechOpen = false;
   // Response-latency instrumentation for the Phase 5 thinking-budget A/B
@@ -1066,7 +1077,19 @@ wss.on("connection", async (clientWs, req) => {
             // comment for why. Every one of this block's several checks below
             // used to call msg.data directly, each one re-triggering the
             // getter's warning and re-walking/re-concatenating every part.
-            const audioData = extractAudioData(msg);
+            let audioData = extractAudioData(msg);
+            if (audioData) {
+              const bytes = Buffer.byteLength(audioData, "base64");
+              if (bytes < MIN_AUDIO_CHUNK_BYTES) {
+                // Logged per chunk: where in the reply it came and how many
+                // parts it had says whether Gemini sent it tiny (one part) or
+                // the relay produced it. Never content, only sizes.
+                const parts = msg.serverContent.modelTurn.parts.filter((p) => p.inlineData).length;
+                console.log(`🔈 Dropped near-empty audio chunk — ${bytes} bytes, ${parts} part(s), ${responseInFlight ? `chunk #${turnAudioChunks + droppedAudioSizes.length + 1} of the reply` : "first of the reply"}`);
+                droppedAudioSizes.push(bytes);
+                audioData = undefined;
+              }
+            }
 
             // First sign of a new turn's response (tool call, audio, or
             // transcript text) after the user finished talking — logs how
@@ -1227,8 +1250,9 @@ wss.on("connection", async (clientWs, req) => {
               // 36s quiet gap before the next turn is Argus not responding.
               if (turnStartedAt) {
                 const spokenMs = Date.now() - turnStartedAt;
-                console.log(`🔇 Turn complete — ${turnAudioChunks} audio chunks over ${spokenMs}ms`);
+                console.log(`🔇 Turn complete — ${turnAudioChunks} audio chunks over ${spokenMs}ms${droppedAudioSizes.length ? ` (+${droppedAudioSizes.length} near-empty dropped)` : ""}`);
               }
+              droppedAudioSizes = [];
               // What the gate actually did this turn: how many chunks it held
               // back, and how many it let through. Before 2026-09-20 the
               // first number counted only chunks the CLIENT had already let
