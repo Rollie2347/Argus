@@ -34,8 +34,28 @@ function url(method) {
   return `${API}/bot${TOKEN}/${method}`;
 }
 
+/**
+ * Flood control. Telegram answers 429 with `retry_after` seconds when a chat
+ * gets messages faster than it allows — which a batch of albums delivered
+ * back to back does (the first real run lost two decks to exactly this and
+ * needed a second pass). Wait it out and retry, a bounded number of times.
+ * getUpdates is excluded: the poll loop has its own backoff.
+ */
+async function call(method, body, opts = {}) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await callOnce(method, body, opts);
+    } catch (err) {
+      const wait = err.retryAfter;
+      if (method === "getUpdates" || !wait || wait > 120 || attempt >= 3) throw err;
+      console.warn(`  ! telegram ${method}: rate limited, waiting ${wait}s (attempt ${attempt + 1}/3)`);
+      await new Promise((r) => setTimeout(r, wait * 1000));
+    }
+  }
+}
+
 /** Never include `method` output or the response body verbatim without redact(). */
-async function call(method, body, { timeoutMs = 20_000, isForm = false } = {}) {
+async function callOnce(method, body, { timeoutMs = 20_000, isForm = false } = {}) {
   let res;
   try {
     res = await fetch(url(method), {
@@ -104,6 +124,39 @@ export async function sendMediaGroup(chatId, files, caption) {
 
   // Albums are slower than text; 10 photos over a slow uplink can take a while.
   return call("sendMediaGroup", form, { isForm: true, timeoutMs: 120_000 });
+}
+
+/** Removes a message — used on the one that carried an Instagram token. */
+export async function deleteMessage(chatId, messageId) {
+  try { return await call("deleteMessage", { chat_id: chatId, message_id: messageId }); }
+  catch (err) { console.warn(`  ! could not delete message: ${redact(err.message)}`); return null; }
+}
+
+/**
+ * A video (the slideshow exactly as it will post) with an HTML caption and,
+ * unlike an album, inline buttons on the same message. Bot API upload cap is
+ * 50 MB; ours are ~1 MB.
+ */
+export async function sendVideo(chatId, bytes, { caption = "", duration, width, height, reply_markup } = {}) {
+  const form = new FormData();
+  form.set("chat_id", String(chatId));
+  form.set("video", new Blob([bytes], { type: "video/mp4" }), "slideshow.mp4");
+  form.set("supports_streaming", "true");
+  if (caption) { form.set("caption", caption.slice(0, 1024)); form.set("parse_mode", "HTML"); }
+  if (duration) form.set("duration", String(duration));
+  if (width) form.set("width", String(width));
+  if (height) form.set("height", String(height));
+  if (reply_markup) form.set("reply_markup", JSON.stringify(reply_markup));
+  return call("sendVideo", form, { isForm: true, timeoutMs: 120_000 });
+}
+
+/** One photo from a local file (a publisher's screenshot). */
+export async function sendPhoto(chatId, bytes, caption = "") {
+  const form = new FormData();
+  form.set("chat_id", String(chatId));
+  if (caption) form.set("caption", caption.slice(0, 1024));
+  form.set("photo", new Blob([bytes]), "screenshot.png");
+  return call("sendPhoto", form, { isForm: true, timeoutMs: 60_000 });
 }
 
 export async function answerCallbackQuery(id, text, showAlert = false) {
