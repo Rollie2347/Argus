@@ -10,3 +10,6 @@ mobile/.env
 
 # audio-probe.mjs diagnostic output (regenerate with backend/scripts/audio-probe.mjs)
 backend/scripts/*.wav
+
+# Stray local env dumps — never commit
+.env.txt
